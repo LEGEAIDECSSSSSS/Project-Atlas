@@ -1,12 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <!-- PLACEHOLDER LOGO. Replace this file (and favicon.svg) with your real logo. -->
-  <defs>
-    <linearGradient id="g" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#2dd4bf"/>
-      <stop offset="1" stop-color="#6366f1"/>
-    </linearGradient>
-  </defs>
-  <rect width="64" height="64" rx="16" fill="url(#g)"/>
-  <path d="M26 21 15 32l11 11M38 21l11 11-11 11" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="32" cy="32" r="3" fill="#fff"/>
+  <rect width="64" height="64" rx="13" fill="#0b0d10"/>
+  <rect x=".75" y=".75" width="62.5" height="62.5" rx="12.4" stroke="#232a33" stroke-width="1.5"/>
+  <path d="M32 11C42.5 21.5 47.4 37 46 53h-6.6C40.3 39 37.2 26 32 16.5Z" fill="#e4e9ee"/>
+  <path d="M32 12C21.5 22.5 17 37 18.2 53" stroke="#e4e9ee" stroke-width="2.1"/>
+  <path d="M20 43.2Q30 40.9 40.4 43.2" stroke="#e2459b" stroke-width="2.4"/>
 </svg>

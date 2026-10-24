@@ -1,10 +1,22 @@
 import { memo, useMemo, useState } from "react";
 import Markdown from "./Markdown";
-import Logo from "./Logo";
-import { APP_NAME } from "../brand";
+import { WORDMARK } from "../brand";
 import { copyText } from "../lib/download";
 import { blocksToFiles, extractCodeBlocks } from "../lib/markdown";
 import { IconCheck, IconCopy, IconDownload, IconFolder, IconRefresh, IconWrench } from "./Icons";
+
+// A small compass needle that swings while Atlas is working.
+function Needle() {
+  return (
+    <svg className="needle" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <g className="needle-swing">
+        <path d="M12 2 15 12H9Z" fill="var(--accent)" />
+        <path d="M12 22 9 12h6Z" fill="currentColor" opacity=".45" />
+      </g>
+      <circle cx="12" cy="12" r="1.6" fill="var(--bg)" />
+    </svg>
+  );
+}
 
 const MODE_LABEL = { chat: "Chat", code: "Code" };
 
@@ -15,6 +27,7 @@ function UserMessage({ message }) {
 
   return (
     <div className="msg msg-user">
+      <div className="gutter">You</div>
       <div className="bubble">
         <div className="user-text">{text}</div>
         {long && (
@@ -65,10 +78,9 @@ function AssistantMessage({ message, isLast, busy, project, onRegenerate, onZip,
 
   return (
     <div className="msg msg-assistant">
-      <div className="avatar"><Logo size={26} /></div>
+      <div className="gutter accent">{WORDMARK}</div>
       <div className="msg-body">
         <div className="msg-head">
-          <strong>{APP_NAME}</strong>
           {meta.mode && (
             <span className="tag">{MODE_LABEL[meta.mode]} · {meta.model}</span>
           )}
@@ -94,13 +106,13 @@ function AssistantMessage({ message, isLast, busy, project, onRegenerate, onZip,
           <Markdown text={message.content} />
         ) : message.streaming && !message.error ? (
           <div className="thinking">
-            <span className="dots"><i /><i /><i /></span>
+            <Needle />
             <span>{message.status || "Thinking…"}</span>
           </div>
         ) : null}
 
         {message.streaming && message.content && message.status && message.status !== "Thinking…" && (
-          <div className="thinking small"><span className="dots"><i /><i /><i /></span><span>{message.status}</span></div>
+          <div className="thinking small"><Needle /><span>{message.status}</span></div>
         )}
 
         {message.error && (

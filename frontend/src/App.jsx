@@ -3,23 +3,15 @@ import {
   applyFiles, deleteConversation, getConversation, getHealth, listConversations,
   projectZipUrl, renameConversation, streamChat, uploadFiles, uploadProject, zipFiles,
 } from "./api";
-import { APP_NAME, TAGLINE } from "./brand";
+import { APP_NAME } from "./brand";
 import Composer from "./components/Composer";
 import { IconMenu } from "./components/Icons";
-import Logo from "./components/Logo";
 import Message from "./components/Message";
 import Sidebar from "./components/Sidebar";
 import { saveBlob, slug } from "./lib/download";
 import { useLocalStorage } from "./lib/hooks";
-
+import Welcome from "./components/Welcome";
 const newId = () => crypto.randomUUID();
-
-const SUGGESTIONS = [
-  { title: "Review my code", text: "Review this code and point out bugs and improvements:\n\n" },
-  { title: "Total up a list", text: "Add up this list and show a table with the total:\n\n" },
-  { title: "Explain an error", text: "Explain this error and how to fix it:\n\n" },
-  { title: "Draft a message", text: "Write a polite, professional message to " },
-];
 
 const MODES = [
   { id: "auto", label: "Auto", hint: "Picks Chat or Code for you" },
@@ -86,7 +78,7 @@ export default function App() {
     check();
     listConversations()
       .then((r) => alive && setConversations(r.conversations))
-      .catch(() => {});
+      .catch(() => { });
     const timer = setInterval(check, 15000);
     return () => {
       alive = false;
@@ -96,7 +88,7 @@ export default function App() {
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+    if (el && messages.length > 0 && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   // ---- conversations -----------------------------------------------------
@@ -423,29 +415,12 @@ export default function App() {
           }}
         >
           {messages.length === 0 ? (
-            <div className="welcome">
-              <Logo size={56} />
-              <h1>{APP_NAME}</h1>
-              <p>{TAGLINE}</p>
-              <div className="suggestions">
-                {SUGGESTIONS.map((s) => (
-                  <button
-                    key={s.title}
-                    type="button"
-                    onClick={() => {
-                      setInput(s.text);
-                      inputRef.current?.focus();
-                    }}
-                  >
-                    {s.title}
-                  </button>
-                ))}
-              </div>
-              <p className="tip">
-                Tip: attach a <b>.zip</b> of a project (or drop files anywhere) and ask me to fix, explain or extend it.
-                I can hand back files you can download.
-              </p>
-            </div>
+            <Welcome
+              onPick={(text) => {
+                setInput(text);
+                inputRef.current?.focus();
+              }}
+            />
           ) : (
             <div className="thread">
               {messages.map((m) => (

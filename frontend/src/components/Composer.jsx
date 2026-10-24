@@ -47,15 +47,18 @@ export default function Composer({
           </div>
         )}
 
-        <textarea
-          ref={inputRef}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder={placeholder}
-          rows={1}
-          aria-label="Message"
-        />
+        <div className="composer-input">
+          <span className="prompt" aria-hidden="true">›</span>
+          <textarea
+            ref={inputRef}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={placeholder}
+            rows={1}
+            aria-label="Message"
+          />
+        </div>
 
         <div className="composer-row">
           <input
@@ -78,7 +81,7 @@ export default function Composer({
           >
             <IconClip />
           </button>
-          <span className="hint">Enter to send · Shift+Enter for a new line</span>
+          <span className="hint">Enter to send · Shift+Enter for a new line · Nothing leaves this machine</span>
           {busy ? (
             <button type="button" className="send stop" onClick={onStop} aria-label="Stop generating" title="Stop (Esc)">
               <IconStop />

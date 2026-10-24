@@ -23,7 +23,7 @@ def _float(name, default):
         return default
 
 
-APP_NAME = os.getenv("LC_APP_NAME", "Local Coder")
+APP_NAME = os.getenv("LC_APP_NAME", "Atlas")
 # Shown before amounts when a pasted list has no currency symbol ("" = none, e.g. "₦").
 CURRENCY = os.getenv("LC_CURRENCY", "")
 
