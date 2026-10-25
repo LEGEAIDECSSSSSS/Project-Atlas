@@ -2,13 +2,12 @@ import io
 import os
 import re
 import shutil
-import tempfile
-import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 
 import config
+from services.locks import project_lock
 
 WORKSPACE = config.WORKSPACE_DIR
 WORKSPACE.mkdir(parents=True, exist_ok=True)
@@ -220,19 +219,101 @@ def _extract_archive(archive, project_dir):
     return {"files": files, "skipped": skipped}
 
 
+def _project_totals(project_dir: Path):
+    """(file count, total bytes) of what is currently in a project."""
+    count = total = 0
+    for path in _walk_files(project_dir):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+        count += 1
+    return count, total
+
+
+def _commit_staged(staged):
+    """Move every staged file into place, or put everything back exactly as it was.
+
+    An existing file is first moved aside (not deleted), so if any later step fails it can be
+    restored, and files that were newly created are removed again.
+    """
+    journal = []   # (target, moved-aside original or None)
+
+    try:
+        for temporary, target in staged:
+            if target.is_dir():
+                raise ValueError(f"{target.name} is a folder in this project.")
+
+            original = None
+            if target.exists():
+                original = target.with_name(f".{target.name}.atlas-old")
+                os.replace(target, original)
+
+            try:
+                os.replace(temporary, target)
+            except Exception:
+                if original is not None:
+                    os.replace(original, target)
+                raise
+
+            journal.append((target, original))
+
+    except Exception:
+        for target, original in reversed(journal):
+            try:
+                target.unlink(missing_ok=True)
+                if original is not None:
+                    os.replace(original, target)
+            except OSError:
+                pass
+        raise
+
+    for _, original in journal:
+        if original is not None:
+            original.unlink(missing_ok=True)
+
+
 def add_uploaded_files(uploads, project_id=None):
-    """Store loose files (not a ZIP) in a new project, or add them to an existing one."""
+    """Store loose files (not a ZIP) in a new project, or add them to an existing one.
+
+    Limits apply to the whole request and to the project as a whole, not just to each file.
+    The upload is all-or-nothing: files are staged first, and if any step of putting them in
+    place fails, everything already moved is undone. Only one change to a project runs at a time.
+    """
+    if project_id:
+        project_path(project_id)                      # fail fast on a bad ID
+        with project_lock(project_id, what="Another upload or a test run"):
+            return _add_uploaded_files(uploads, project_id)
+
+    return _add_uploaded_files(uploads, None)
+
+
+def _add_uploaded_files(uploads, project_id):
     if project_id:
         project_dir = project_path(project_id)
         created = False
+        existing_files, existing_bytes = _project_totals(project_dir)
     else:
         project_id = str(uuid.uuid4())
         project_dir = WORKSPACE / project_id
         project_dir.mkdir(parents=True, exist_ok=True)
         created = True
+        existing_files = existing_bytes = 0
 
     root = project_dir.resolve()
-    files = 0
+    per_file = config.MAX_SINGLE_FILE_MB * MB
+    batch_limit = config.MAX_BATCH_UPLOAD_MB * MB
+    project_room = config.MAX_UNZIPPED_MB * MB - existing_bytes
+    allowed = min(batch_limit, project_room)
+    cumulative_message = (
+        f"These files add up to more than {config.MAX_BATCH_UPLOAD_MB} MB."
+        if batch_limit <= project_room
+        else f"Adding these files would take the project over {config.MAX_UNZIPPED_MB} MB."
+    )
+
+    staged = []   # (temporary path, final path)
+    names = set()
+    used = 0
     skipped = 0
 
     try:
@@ -243,30 +324,54 @@ def add_uploaded_files(uploads, project_id=None):
                 skipped += 1
                 continue
 
+            key = relative.as_posix().lower()
+            if key in names:
+                raise ValueError(
+                    f"Two of the files have the same path ({relative}). Nothing was uploaded."
+                )
+            names.add(key)
+
             target = (project_dir / relative).resolve()
 
             if not target.is_relative_to(root):
                 raise ValueError("Invalid file path.")
 
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            with target.open("wb") as out:
-                _copy_limited(
-                    stream, out, config.MAX_SINGLE_FILE_MB * MB,
-                    f"{relative.name} is larger than {config.MAX_SINGLE_FILE_MB} MB.",
+            if existing_files + len(staged) >= config.MAX_PROJECT_FILES:
+                raise ValueError(
+                    f"A project can hold at most {config.MAX_PROJECT_FILES} files."
                 )
 
-            files += 1
+            remaining = allowed - used
+            if remaining <= 0:
+                raise ValueError(cumulative_message)
 
-        if files == 0:
+            limit = min(per_file, remaining)
+            message = (
+                f"{relative.name} is larger than {config.MAX_SINGLE_FILE_MB} MB."
+                if per_file <= remaining
+                else cumulative_message
+            )
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.atlas-upload")
+            staged.append((temporary, target))
+
+            with temporary.open("wb") as out:
+                used += _copy_limited(stream, out, limit, message)
+
+        if not staged:
             raise ValueError("No usable files were uploaded.")
 
+        _commit_staged(staged)
+
     except Exception:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
         if created:
             shutil.rmtree(project_dir, ignore_errors=True)
         raise
 
-    return {"project_id": project_id, "files": files, "skipped": skipped}
+    return {"project_id": project_id, "files": len(staged), "skipped": skipped}
 
 
 # --------------------------------------------------------------------------
@@ -449,96 +554,33 @@ def build_project_context(project_id: str, char_budget: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Writing generated files back / downloading
+# Bundling generated code blocks for download
 # --------------------------------------------------------------------------
 
-def apply_files(project_id: str, files, dry_run=False):
-    """Write generated files into the project. Replaced files are backed up first."""
-    project_dir = project_path(project_id)
-    root = project_dir.resolve()
-    plan = []
-
-    for item in files:
-        relative = clean_relative_path(item.get("path", ""))
-
-        if relative is None:
-            raise ValueError(f"Cannot write to {item.get('path')!r}.")
-
-        content = item.get("content", "")
-
-        if len(content) > 2 * MB:
-            raise ValueError(f"{relative} is too large to apply.")
-
-        target = (project_dir / relative).resolve()
-
-        if not target.is_relative_to(root):
-            raise ValueError("Invalid file path.")
-
-        entry = {
-            "path": relative.as_posix(),
-            "status": "created",
-            "old_lines": 0,
-            "new_lines": len(content.splitlines()),
-            "shrunk": False,
-        }
-
-        if target.is_file():
-            try:
-                old = read_text_file(target)
-            except ValueError:
-                raise ValueError(f"{relative} is a binary file and cannot be replaced.")
-            entry["status"] = "replaced"
-            entry["old_lines"] = len(old.splitlines())
-            entry["shrunk"] = (
-                entry["old_lines"] >= 10
-                and entry["new_lines"] < entry["old_lines"] * 0.6
-            )
-
-        plan.append((entry, target, content))
-
-    if not dry_run:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup_root = config.BACKUP_DIR / project_id / stamp
-
-        for entry, target, content in plan:
-            if target.is_file():
-                old_bytes = target.read_bytes()
-                backup = backup_root / entry["path"]
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                backup.write_bytes(old_bytes)
-                # Keep Windows line endings if the file used them.
-                if b"\r\n" in old_bytes and "\r\n" not in content:
-                    content = content.replace("\n", "\r\n")
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content.encode("utf-8"))
-
-    return [entry for entry, _, _ in plan]
-
-
-def zip_project(project_id: str) -> str:
-    """Zip the whole project to a temporary file and return its path."""
-    project_dir = project_path(project_id)
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    handle.close()
-
-    with zipfile.ZipFile(handle.name, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in _walk_files(project_dir):
-            archive.write(path, path.relative_to(project_dir).as_posix())
-
-    return handle.name
-
-
 def zip_files(files) -> bytes:
-    """Zip generated files (a list of {path, content}) in memory."""
+    """Zip generated files (a list of {path, content}) in memory, within size limits."""
+    files = list(files)
+
+    if len(files) > config.MAX_ZIP_DOWNLOAD_FILES:
+        raise ValueError(f"Too many files for one ZIP (the limit is {config.MAX_ZIP_DOWNLOAD_FILES}).")
+
     buffer = io.BytesIO()
     seen = {}
+    names = set()
+    total = 0
 
     for index, item in enumerate(files, start=1):
         relative = clean_relative_path(item.get("path") or f"file-{index}.txt")
         if relative is None:
             relative = PurePosixPath(f"file-{index}.txt")
-        seen[relative.as_posix()] = item.get("content", "")
+        if relative.as_posix().lower() in names:
+            raise ValueError(f"Two files have the same path ({relative}). Nothing was zipped.")
+        names.add(relative.as_posix().lower())
+        content = item.get("content", "")
+        total += len(content.encode("utf-8"))
+        if total > config.MAX_ZIP_DOWNLOAD_MB * MB:
+            raise ValueError(f"These files add up to more than {config.MAX_ZIP_DOWNLOAD_MB} MB.")
+        seen[relative.as_posix()] = content
 
     if not seen:
         raise ValueError("There are no files to zip.")

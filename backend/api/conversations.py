@@ -1,9 +1,11 @@
+import asyncio
 import shutil
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services import db
+from services.locks import ProjectBusy, project_lock
 from services.project_service import WORKSPACE, PROJECT_ID_PATTERN
 
 
@@ -26,7 +28,12 @@ async def get_conversation(conversation_id: str):
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
-    return {**conversation, "messages": db.get_messages(conversation_id)}
+    project_id = conversation.get("project_id")
+    return {
+        **conversation,
+        "tests_approved": db.tests_approved(project_id) if project_id else False,
+        "messages": db.get_messages(conversation_id),
+    }
 
 
 @router.patch("/conversations/{conversation_id}")
@@ -39,6 +46,12 @@ async def rename_conversation(conversation_id: str, body: RenameRequest):
     return {"id": conversation_id, "title": title}
 
 
+def _remove_project(project_id):
+    with project_lock(project_id, what="A test run or upload"):
+        shutil.rmtree(WORKSPACE / project_id, ignore_errors=True)
+        db.clear_project_flags(project_id)
+
+
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
     conversation = db.get_conversation(conversation_id)
@@ -46,15 +59,19 @@ async def delete_conversation(conversation_id: str):
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
-    db.delete_conversation(conversation_id)
-
-    # Remove the uploaded project too, unless another conversation still uses it.
     project_id = conversation.get("project_id")
-    if (
+    removable = (
         project_id
         and PROJECT_ID_PATTERN.match(project_id)
-        and not db.project_in_use(project_id)
-    ):
-        shutil.rmtree(WORKSPACE / project_id, ignore_errors=True)
+        and not db.project_in_use(project_id, excluding=conversation_id)
+    )
 
+    # Never delete a project folder while tests or an upload are using it.
+    if removable:
+        try:
+            await asyncio.to_thread(_remove_project, project_id)
+        except ProjectBusy as error:
+            raise HTTPException(status_code=409, detail=str(error))
+
+    db.delete_conversation(conversation_id)
     return {"deleted": conversation_id}

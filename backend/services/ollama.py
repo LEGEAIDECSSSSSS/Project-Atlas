@@ -64,6 +64,7 @@ async def stream_chat(messages, model, temperature=0.3, num_predict=None):
                             "stats": {
                                 "tokens": count,
                                 "tokens_per_second": round(count / duration, 1) if duration else None,
+                                "prompt_tokens": data.get("prompt_eval_count"),
                             },
                         }
                         return

@@ -6,8 +6,12 @@ from datetime import date
 from pathlib import PurePosixPath
 
 import config
-from agent.context import fit_messages
-from agent.prompts import CHAT_PROMPT, CODE_OUTPUT_RULES, SYSTEM_PROMPT
+from agent.context import estimate_tokens, fit_messages
+from agent import evidence as ev
+from agent.prompts import (
+    CHAT_PROMPT, CODE_OUTPUT_RULES, GROUNDING_RULES, SYSTEM_PROMPT, SYSTEM_PROMPT_COMPACT,
+)
+from agent.verify import check_answer, format_notes
 from services.calculator import calculate
 from services.ollama import stream_chat
 from services.project_service import (
@@ -130,23 +134,22 @@ PROJECT_DOC = """\
   optional "start_line" and "end_line" to read part of a large file.
 - list_project_files: no arguments.
 - run_project_tests: no arguments. Runs the project's Maven tests with a fixed command.
+  This executes the project's own code, so it only works after the USER has approved it
+  (the "Tests" switch on the project chip). If it says approval is needed, do not retry:
+  tell the user how to allow it, and say the tests were NOT run.
 
 The project ID is filled in automatically; do not include it.
 
-INVESTIGATION RULES
-- Read recent conversation messages before deciding what the user means. Follow-ups such as
-  "that file" or "the method" refer to earlier messages.
-- If the conversation or the project listing already contains the answer, answer directly.
-- Search only when evidence is missing. Terms separated by "|" are alternatives.
-- Do not conclude a feature is absent from one unsuccessful search.
 """
 
 
-def build_system_prompt(mode, project_id=None, project_context=""):
+def build_system_prompt(mode, project_id=None, project_context="", evidence_block=""):
     tools = CALCULATE_DOC
 
     if mode == "code":
-        prompt = SYSTEM_PROMPT.strip() + "\n\n" + CODE_OUTPUT_RULES.strip()
+        base = SYSTEM_PROMPT_COMPACT if config.COMPACT_PROMPTS else SYSTEM_PROMPT
+        prompt = base.strip() + "\n\n" + CODE_OUTPUT_RULES.strip()
+        prompt += "\n\n" + GROUNDING_RULES.strip()
         if project_id:
             tools = PROJECT_DOC + tools
     else:
@@ -163,6 +166,8 @@ def build_system_prompt(mode, project_id=None, project_context=""):
             "The user attached this project. Use it as the source of truth.\n\n"
             + (project_context or "")
         )
+        if mode == "code":
+            prompt += "\n\n" + evidence_block
 
     return prompt
 
@@ -434,21 +439,31 @@ async def run_agent_stream(
     mode="chat",
     model=None,
     project_context="",
+    evidence=None,
+    tests_approved=False,
 ):
     """Run the agent and yield events:
 
-    status / token / tool / warning / done   (errors are raised as OllamaError)
+    status / token / tool / evidence / warning / done   (errors are raised as OllamaError)
+
+    `project_id` and `tests_approved` come from the backend (the user's own request and
+    stored permissions). The model can never choose a project or grant itself permission.
     """
     model = model or (config.CODE_MODEL if mode == "code" else config.CHAT_MODEL)
     temperature = config.TEMPERATURE_CODE if mode == "code" else config.TEMPERATURE_CHAT
 
-    # Preserve the remembered project ID when the message does not contain a new one.
-    active_project_id = extract_project_id(message) or project_id
+    # Only the trusted request / stored attachment decides which project is used. Text typed
+    # in the message, pasted documents and model-written tool arguments cannot change it.
+    active_project_id = project_id
+    prior_evidence = list(evidence or [])
+    turn_evidence = []
 
     messages = [
         {
             "role": "system",
-            "content": build_system_prompt(mode, active_project_id, project_context),
+            "content": build_system_prompt(
+                mode, active_project_id, project_context, ev.render_block(prior_evidence)
+            ),
         }
     ]
 
@@ -479,9 +494,24 @@ async def run_agent_stream(
         full = ""
         decision = "text" if last_chance else None
 
-        async for chunk in stream_chat(messages, model, temperature):
+        # Let the answer use only the room that is really left, so a long prompt can never push
+        # the model past its context window (which would silently cut off the instructions).
+        estimated = sum(estimate_tokens(m["content"]) for m in messages)
+        room = max(256, min(config.NUM_PREDICT, config.NUM_CTX - estimated - 64))
+
+        async for chunk in stream_chat(messages, model, temperature, num_predict=room):
             if chunk.get("done"):
                 stats = chunk.get("stats")
+                counted = (stats or {}).get("prompt_tokens")
+                if counted:
+                    print(f"CONTEXT: estimated {estimated} prompt tokens, Ollama counted {counted} "
+                          f"(window {config.NUM_CTX})")
+                    if counted >= config.NUM_CTX * 0.97:
+                        yield {
+                            "type": "warning",
+                            "text": "This conversation has filled the model's memory, so some earlier "
+                                    "details may have been dropped. Start a new chat for best results.",
+                        }
                 continue
 
             piece = chunk["text"]
@@ -503,11 +533,26 @@ async def run_agent_stream(
             if not full.strip():
                 full = "The model returned an empty response. Please try again."
                 yield {"type": "token", "text": full}
+
+            if mode == "code" and active_project_id:
+                try:
+                    project_files = await asyncio.to_thread(list_project_files, active_project_id)
+                    notes = check_answer(
+                        full, project_files, message, ev.merge([prior_evidence, turn_evidence])
+                    )
+                except Exception:
+                    notes = []
+                if notes:
+                    extra = format_notes(notes)
+                    full += extra
+                    yield {"type": "token", "text": extra}
+
             yield {
                 "type": "done",
                 "response": full,
                 "project_id": active_project_id,
                 "stats": stats,
+                "evidence": turn_evidence,
             }
             return
 
@@ -521,6 +566,7 @@ async def run_agent_stream(
                 "response": full,
                 "project_id": active_project_id,
                 "stats": stats,
+                "evidence": turn_evidence,
             }
             return
 
@@ -530,18 +576,7 @@ async def run_agent_stream(
         messages.append({"role": "assistant", "content": full.strip()})
 
         if tool_name in PROJECT_TOOLS:
-            supplied = arguments.get("project_id")
-
-            # Always prefer the established project ID over a placeholder or a
-            # different ID generated by the model.
-            if active_project_id:
-                arguments["project_id"] = active_project_id
-
-            elif not is_placeholder_project_id(supplied):
-                active_project_id = supplied.strip()
-                arguments["project_id"] = active_project_id
-
-            else:
+            if not active_project_id:
                 messages.append({
                     "role": "user",
                     "content": (
@@ -554,20 +589,25 @@ async def run_agent_stream(
                 })
                 continue
 
+            # Always the trusted project, never an ID the model wrote.
+            arguments["project_id"] = active_project_id
+
         print("TOOL CALL:", tool_name, arguments)
         yield {"type": "status", "text": tool_status(tool_name, arguments)}
 
         try:
-            result = await _call_tool(tool_name, arguments)
-
-            if (
-                tool_name in PROJECT_TOOLS
-                and isinstance(result, dict)
-                and not result.get("error")
-                and result.get("project_id")
-                and not is_placeholder_project_id(result.get("project_id"))
-            ):
-                active_project_id = result["project_id"]
+            if tool_name == "run_project_tests" and not tests_approved:
+                result = {
+                    "status": "not_run",
+                    "error": (
+                        "The user has not approved running tests for this project, so NO tests "
+                        "were run. Running tests executes the project's own code on the user's "
+                        "computer. Do not retry. Tell the user they can switch Tests to "
+                        "'allowed' on the project chip if they trust this project."
+                    ),
+                }
+            else:
+                result = await _call_tool(tool_name, arguments)
 
         except Exception as error:
             result = {"error": str(error)}
@@ -594,10 +634,21 @@ async def run_agent_stream(
                 except Exception as error:
                     result["automatic_read_error"] = str(error)
 
+        records = ev.records_from_tool(tool_name, arguments, result)
+        turn_evidence.extend(records)
+        if records:
+            yield {"type": "evidence", "records": records}
+
+        label = tool_label(tool_name, arguments)
+        if isinstance(result, dict) and result.get("status") == "not_run":
+            label = "Tests not run (needs your approval)"
+        elif tool_name == "run_project_tests" and isinstance(result, dict):
+            label = f"Ran project tests: {ev.test_status(result).replace('_', ' ')}"
+
         yield {
             "type": "tool",
             "name": tool_name,
-            "label": tool_label(tool_name, arguments),
+            "label": label,
             "ok": not (isinstance(result, dict) and result.get("error")),
         }
 
@@ -616,7 +667,8 @@ async def run_agent_stream(
         messages, _ = fit_messages(messages)
 
     # Unreachable: the final iteration always answers in text.
-    yield {"type": "done", "response": "", "project_id": active_project_id, "stats": stats}
+    yield {"type": "done", "response": "", "project_id": active_project_id, "stats": stats,
+           "evidence": turn_evidence}
 
 
 async def run_agent(message: str, history=None, project_id=None, mode="code", model=None):

@@ -1,13 +1,18 @@
-
+import collections
+import os
+import re
 import shutil
+import signal
 import subprocess
+import threading
 from pathlib import Path
 
-from services.project_service import WORKSPACE
+import config
+from services.locks import ProjectBusy, project_lock
+from services.project_service import project_path
 
-
-TIMEOUT_SECONDS = 120
-MAX_OUTPUT_CHARS = 12000
+TIMEOUT_SECONDS = config.TEST_TIMEOUT_SECONDS
+MAX_OUTPUT_CHARS = config.TEST_OUTPUT_CHARS
 
 IGNORED_DIRECTORIES = {
     ".git",
@@ -18,6 +23,13 @@ IGNORED_DIRECTORIES = {
     "build",
     "dist",
 }
+
+# Variables that look like credentials are not passed to the test process.
+SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+SUMMARY = re.compile(
+    r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)(?:,\s*Skipped:\s*(\d+))?"
+)
 
 
 def find_maven_project(project_dir: Path):
@@ -56,18 +68,118 @@ def find_maven_project(project_dir: Path):
     return pom_files[0].parent
 
 
+def scrubbed_environment():
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not any(hint in key.upper() for hint in SECRET_HINTS)
+    }
+
+
+def kill_process_tree(process):
+    """Stop the process AND everything it started (Maven forks a separate test JVM)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=15,
+            )
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def run_bounded(command, cwd, timeout, max_chars, env=None):
+    """Run a command with a time limit and a hard cap on how much output is kept in memory.
+
+    Returns (exit_code, output_tail, timed_out). Output beyond the cap is discarded as it
+    arrives instead of being buffered, so a test that prints gigabytes cannot exhaust memory.
+    """
+    options = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": env,
+        "shell": False,
+    }
+
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+
+    process = subprocess.Popen(command, **options)
+
+    chunks = collections.deque()
+    size = 0
+
+    def reader():
+        nonlocal size
+        for chunk in iter(lambda: process.stdout.read(4096), ""):
+            chunks.append(chunk)
+            size += len(chunk)
+            while size > max_chars * 2 and len(chunks) > 1:
+                size -= len(chunks.popleft())
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_process_tree(process)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+    thread.join(timeout=5)
+    output = "".join(chunks).strip()[-max_chars:]
+    return process.returncode, output, timed_out
+
+
+def summarize(output):
+    """Pull the last Maven 'Tests run: N, Failures: F, Errors: E' line out of the output."""
+    matches = SUMMARY.findall(output or "")
+    if not matches:
+        return None
+    run, failures, errors, skipped = matches[-1]
+    return {
+        "tests_run": int(run),
+        "failures": int(failures),
+        "errors": int(errors),
+        "skipped": int(skipped or 0),
+    }
+
+
 def run_project_tests(project_id: str):
-    """Run Maven tests using its Java launcher."""
+    """Run Maven tests using its Java launcher. Only called after the user approves it.
 
-    workspace = WORKSPACE.resolve()
-    project_dir = (workspace / project_id).resolve()
+    Only one test run (or upload) may touch a project at a time; a second request is refused
+    straight away rather than queued behind a run that can take minutes.
+    """
+    project_path(project_id)    # validate the ID before anything else
 
-    if not project_dir.is_relative_to(workspace):
-        raise ValueError("Invalid project ID.")
+    try:
+        with project_lock(project_id, timeout=0, what="Another test run or upload"):
+            return _run_project_tests(project_id)
+    except ProjectBusy as error:
+        return {"project_id": project_id, "status": "error", "error": str(error)}
 
-    if not project_dir.is_dir():
-        raise FileNotFoundError("Project not found.")
 
+def _run_project_tests(project_id: str):
+    project_dir = project_path(project_id)
     project_root = find_maven_project(project_dir)
 
     maven = shutil.which("mvn.cmd") or shutil.which("mvn")
@@ -125,62 +237,38 @@ def run_project_tests(project_id: str):
         "test",
     ]
 
+    base = {
+        "project_id": project_id,
+        "build_system": "Maven",
+        "command": "java Maven launcher -B -ntp test",
+    }
+
     try:
-        result = subprocess.run(
+        exit_code, output, timed_out = run_bounded(
             command,
             cwd=project_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=TIMEOUT_SECONDS,
-            shell=False,
+            max_chars=MAX_OUTPUT_CHARS,
+            env=scrubbed_environment(),
         )
-
-        output = (
-            (result.stdout or "")
-            + "\n"
-            + (result.stderr or "")
-        ).strip()
-
-        return {
-            "project_id": project_id,
-            "build_system": "Maven",
-            "command": "java Maven launcher -B -ntp test",
-            "status": (
-                "passed" if result.returncode == 0 else "failed"
-            ),
-            "exit_code": result.returncode,
-            "output": output[-MAX_OUTPUT_CHARS:],
-        }
-
-    except subprocess.TimeoutExpired as error:
-        stdout = error.stdout or ""
-        stderr = error.stderr or ""
-
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-
-        output = f"{stdout}\n{stderr}".strip()
-
-        return {
-            "project_id": project_id,
-            "build_system": "Maven",
-            "command": "java Maven launcher -B -ntp test",
-            "status": "timeout",
-            "error": (
-                f"Tests exceeded the {TIMEOUT_SECONDS}-second time limit."
-            ),
-            "output": output[-MAX_OUTPUT_CHARS:],
-        }
-
     except OSError as error:
+        return {**base, "status": "error", "error": str(error)}
+
+    counts = summarize(output)
+
+    if timed_out:
         return {
-            "project_id": project_id,
-            "build_system": "Maven",
-            "status": "error",
-            "error": str(error),
+            **base,
+            "status": "timeout",
+            "error": f"Tests exceeded the {TIMEOUT_SECONDS}-second time limit and were stopped.",
+            "output": output,
+            **({"summary": counts} if counts else {}),
         }
+
+    return {
+        **base,
+        "status": "passed" if exit_code == 0 else "failed",
+        "exit_code": exit_code,
+        "output": output,
+        **({"summary": counts} if counts else {}),
+    }

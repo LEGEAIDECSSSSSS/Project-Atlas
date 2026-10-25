@@ -35,11 +35,13 @@ class FakeOllama:
         self.installed = ["qwen2.5-coder:7b", "qwen2.5:7b"]
         self.script = []
         self.requests = []
+        self.prompt_eval_count = None
 
     def reset(self):
         self.installed = ["qwen2.5-coder:7b", "qwen2.5:7b"]
         self.script = []
         self.requests = []
+        self.prompt_eval_count = None
 
 
 fake = FakeOllama()
@@ -71,7 +73,8 @@ async def chat(request: Request):
     async def stream():
         for i in range(0, len(reply), 7):
             yield json.dumps({"message": {"role": "assistant", "content": reply[i:i + 7]}, "done": False}) + "\n"
-        yield json.dumps({"message": {"content": ""}, "done": True, "eval_count": 40, "eval_duration": 2_000_000_000}) + "\n"
+        yield json.dumps({"message": {"content": ""}, "done": True, "eval_count": 40, "eval_duration": 2_000_000_000,
+                          **({"prompt_eval_count": fake.prompt_eval_count} if fake.prompt_eval_count else {})}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 

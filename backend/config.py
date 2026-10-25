@@ -44,8 +44,13 @@ TEMPERATURE_CHAT = _float("LC_TEMPERATURE_CHAT", 0.5)
 # --- Agent -----------------------------------------------------------------
 MAX_TOOL_CALLS = _int("LC_MAX_TOOL_CALLS", 8)
 CHARS_PER_TOKEN = 3.0                       # conservative estimate for code
-OUTPUT_RESERVE_TOKENS = min(NUM_PREDICT, 2048)
+# Room kept free for the answer. It shrinks with small context windows so the input still fits.
+OUTPUT_RESERVE_TOKENS = min(NUM_PREDICT, 2048, max(512, NUM_CTX // 3))
 PROMPT_BUDGET_TOKENS = max(1024, NUM_CTX - OUTPUT_RESERVE_TOKENS)
+# With a small window the full rule list would not leave room for the conversation.
+COMPACT_PROMPTS = PROMPT_BUDGET_TOKENS < 4500
+SYSTEM_SHARE = 0.6                          # most of the budget the system prompt may use
+EVIDENCE_SHARE = 0.12                       # most of the budget the evidence list may use
 MAX_FILE_CHARS = int(PROMPT_BUDGET_TOKENS * CHARS_PER_TOKEN * 0.30)
 
 # --- Storage ---------------------------------------------------------------
@@ -53,10 +58,12 @@ MAX_FILE_CHARS = int(PROMPT_BUDGET_TOKENS * CHARS_PER_TOKEN * 0.30)
 # backend folder, and uploading a Python project would restart the server.
 DATA_DIR = Path(os.getenv("LC_DATA_DIR", BASE_DIR.parent / "data")).resolve()
 WORKSPACE_DIR = DATA_DIR / "workspace"
-BACKUP_DIR = DATA_DIR / "backups"
 DB_PATH = DATA_DIR / "localcoder.db"
 
 MAX_UPLOAD_MB = _int("LC_MAX_UPLOAD_MB", 200)
+MAX_BATCH_UPLOAD_MB = _int("LC_MAX_BATCH_UPLOAD_MB", 100)   # one request of loose files
+MAX_ZIP_DOWNLOAD_FILES = _int("LC_MAX_ZIP_FILES", 500)      # generated ZIPs ("Download .zip")
+MAX_ZIP_DOWNLOAD_MB = _int("LC_MAX_ZIP_MB", 50)
 MAX_UNZIPPED_MB = _int("LC_MAX_UNZIPPED_MB", 400)
 MAX_PROJECT_FILES = _int("LC_MAX_PROJECT_FILES", 20000)
 MAX_SINGLE_FILE_MB = _int("LC_MAX_SINGLE_FILE_MB", 25)
@@ -69,3 +76,11 @@ CORS_ORIGINS = [
     ).split(",")
     if o.strip()
 ]
+
+
+# --- Safety -------------------------------------------------------------------
+# Atlas never edits your project. It only shows code for you to copy, or to download as files.
+TEST_TIMEOUT_SECONDS = _int("LC_TEST_TIMEOUT", 120)
+TEST_OUTPUT_CHARS = _int("LC_TEST_OUTPUT_CHARS", 12000)
+# How long a request waits for another operation on the same project before giving up.
+LOCK_TIMEOUT_SECONDS = _float("LC_LOCK_TIMEOUT", 5)

@@ -42,6 +42,11 @@ def init_db():
                 created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
+            CREATE TABLE IF NOT EXISTS project_flags (
+                project_id TEXT PRIMARY KEY,
+                tests_approved INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
             """
         )
 
@@ -98,10 +103,12 @@ def delete_conversation(conversation_id):
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
 
 
-def project_in_use(project_id):
+def project_in_use(project_id, excluding=None):
+    """True if a conversation other than `excluding` still uses this project."""
     with _db() as conn:
         row = conn.execute(
-            "SELECT 1 FROM conversations WHERE project_id = ? LIMIT 1", (project_id,)
+            "SELECT 1 FROM conversations WHERE project_id = ? AND id != ? LIMIT 1",
+            (project_id, excluding or ""),
         ).fetchone()
     return row is not None
 
@@ -161,3 +168,30 @@ def pop_last_turn(conversation_id):
         for m in to_delete:
             conn.execute("DELETE FROM messages WHERE id = ?", (m["id"],))
     return user_text
+
+
+# ---- per-project permissions -------------------------------------------------
+def tests_approved(project_id):
+    """True only if the user explicitly allowed running this project's tests."""
+    if not project_id:
+        return False
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT tests_approved FROM project_flags WHERE project_id = ?", (project_id,)
+        ).fetchone()
+    return bool(row and row["tests_approved"])
+
+
+def set_tests_approved(project_id, approved):
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO project_flags (project_id, tests_approved, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET tests_approved = excluded.tests_approved, "
+            "updated_at = excluded.updated_at",
+            (project_id, 1 if approved else 0, time.time()),
+        )
+
+
+def clear_project_flags(project_id):
+    with _db() as conn:
+        conn.execute("DELETE FROM project_flags WHERE project_id = ?", (project_id,))

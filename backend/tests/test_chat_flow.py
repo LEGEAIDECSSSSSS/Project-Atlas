@@ -180,30 +180,6 @@ def test_project_chat_with_tools_and_context(client, script):
     assert conv["messages"][-1]["meta"]["tools"] == labels
 
 
-def test_apply_backup_crlf_and_download(client):
-    pid = upload(client)["project_id"]
-
-    dry = client.post(f"/projects/{pid}/apply", json={"dry_run": True, "files": [
-        {"path": "app/main.py", "content": "x\n"}, {"path": "new/thing.py", "content": "a\nb\n"}]}).json()
-    assert [f["status"] for f in dry["files"]] == ["replaced", "created"]
-    assert client.get(f"/projects/{pid}/file", params={"path": "app/main.py"}).json()["content"].startswith("def add")
-
-    fixed = "def add(a, b):\n    return a + b\n"
-    r = client.post(f"/projects/{pid}/apply", json={"files": [{"path": "app/main.py", "content": fixed}]})
-    assert r.status_code == 200
-    content = client.get(f"/projects/{pid}/file", params={"path": "app/main.py"}).json()["content"]
-    assert content == "def add(a, b):\r\n    return a + b\r\n"       # original CRLF preserved
-
-    import config
-    backups = list((config.BACKUP_DIR / pid).rglob("main.py"))
-    assert len(backups) == 1 and b"a - b" in backups[0].read_bytes()
-
-    z = client.get(f"/projects/{pid}/download", params={"name": "my fix"})
-    assert "my%20fix.zip" in z.headers["content-disposition"]
-    names = zipfile.ZipFile(io.BytesIO(z.content)).namelist()
-    assert "app/main.py" in names and not any("node_modules" in n for n in names)
-
-
 def test_download_zip_of_generated_blocks(client):
     r = client.post("/download-zip", json={"name": "out", "files": [
         {"path": "src/a.py", "content": "print(1)"}, {"path": "b.txt", "content": "hi"}]})
@@ -229,7 +205,7 @@ def test_security(client):
     assert client.get("/projects/not-an-id/files").status_code == 400
     assert client.get(f"/projects/{pid}/file", params={"path": "../../../etc/passwd"}).status_code == 400
     for bad in ["../x.py", "/abs.py", "C:/x.py", "a/../../x.py"]:
-        r = client.post(f"/projects/{pid}/apply", json={"files": [{"path": bad, "content": "x"}]})
+        r = client.post("/upload-files", data={"project_id": pid}, files=[("files", (bad, b"x"))])
         assert r.status_code == 400, bad
     assert client.post("/chat/stream", json={"message": "x", "conversation_id": "../bad"}).status_code == 400
 

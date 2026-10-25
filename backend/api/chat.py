@@ -8,7 +8,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import config
-from agent.agent import run_agent_stream
+from agent import evidence as ev
+from agent.agent import build_system_prompt, run_agent_stream
 from agent.router import resolve_mode
 from services import db
 from services.listparse import try_total_list
@@ -56,8 +57,13 @@ async def _run_chat(request: ChatRequest):
 
     # Save the user's message first, so "Try again" always has something to retry,
     # even if the model or Ollama turns out to be unavailable.
-    history = db.get_messages(conversation_id, limit=MAX_HISTORY_MESSAGES)
-    is_first = not history
+    everything = db.get_messages(conversation_id)
+    history = everything[-MAX_HISTORY_MESSAGES:]
+    is_first = not everything
+    # What the agent has actually done so far (recorded by the backend from real tool results).
+    prior_evidence = ev.merge(
+        [m["meta"].get("evidence", []) for m in everything if m["role"] == "assistant"]
+    )
 
     db.add_message(conversation_id, "user", message)
     if is_first or conversation["title"] == "New chat":
@@ -123,9 +129,13 @@ async def _run_chat(request: ChatRequest):
     project_context = ""
     if project_id:
         try:
-            project_context = await asyncio.to_thread(
-                build_project_context, project_id, int(config.MAX_FILE_CHARS * 0.9)
-            )
+            # The system prompt may use only a share of the window. Everything fixed (rules, tools,
+            # evidence) is counted first and the project listing gets what is left.
+            fixed = len(build_system_prompt(mode, project_id, "", ev.render_block(prior_evidence)))
+            system_cap = int(config.PROMPT_BUDGET_TOKENS * config.CHARS_PER_TOKEN * config.SYSTEM_SHARE)
+            floor = int(config.PROMPT_BUDGET_TOKENS * config.CHARS_PER_TOKEN * 0.06)
+            context_budget = max(floor, min(int(config.MAX_FILE_CHARS * 0.9), system_cap - fixed))
+            project_context = await asyncio.to_thread(build_project_context, project_id, context_budget)
         except (ValueError, FileNotFoundError) as error:
             yield {"type": "warning", "text": f"The attached project could not be read: {error}"}
             project_id = None
@@ -153,7 +163,9 @@ async def _run_chat(request: ChatRequest):
 
     partial = ""
     tools_used = []
+    turn_evidence = []
     saved = False
+    tests_ok = db.tests_approved(project_id) if project_id else False
 
     try:
         async for event in run_agent_stream(
@@ -163,22 +175,28 @@ async def _run_chat(request: ChatRequest):
             mode=mode,
             model=model,
             project_context=project_context,
+            evidence=prior_evidence,
+            tests_approved=tests_ok,
         ):
             if event["type"] == "token":
                 partial += event["text"]
             elif event["type"] == "tool":
                 tools_used.append(event["label"])
+            elif event["type"] == "evidence":
+                turn_evidence.extend(event["records"])
+                continue            # internal: not sent to the browser
             elif event["type"] == "done":
                 meta = {"mode": mode, "model": model, "tools": tools_used}
+                if turn_evidence:
+                    meta["evidence"] = turn_evidence
                 if event.get("stats"):
                     meta["stats"] = event["stats"]
                 message_id = db.add_message(
                     conversation_id, "assistant", event["response"], meta
                 )
                 saved = True
+                event = {k: v for k, v in event.items() if k != "evidence"}
                 event = {**event, "message_id": message_id, "meta": meta}
-                if event.get("project_id") and event["project_id"] != project_id:
-                    db.update_conversation(conversation_id, project_id=event["project_id"])
             yield event
 
     except OllamaError as error:
@@ -191,7 +209,8 @@ async def _run_chat(request: ChatRequest):
                 conversation_id,
                 "assistant",
                 partial,
-                {"mode": mode, "model": model, "tools": tools_used, "stopped": True},
+                {"mode": mode, "model": model, "tools": tools_used, "stopped": True,
+                 **({"evidence": turn_evidence} if turn_evidence else {})},
             )
 
 
