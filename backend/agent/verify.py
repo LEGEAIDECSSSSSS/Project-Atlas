@@ -1,10 +1,5 @@
-"""Check an answer against the evidence, and add a visible note when it does not hold up.
 
-These are deterministic checks done by the backend, not instructions to the model.
-They cannot prove an answer is right; they catch the specific failures that matter most:
-naming files that do not exist, claiming to have read files that were never opened, and
-claiming tests passed when no passing run exists.
-"""
+"""Check project answers against actual files and tool evidence."""
 import re
 from pathlib import PurePosixPath
 
@@ -15,33 +10,63 @@ EXTENSIONS = (
     "xml|json|ya?ml|toml|gradle|properties|md|txt|sh|bat|ps1"
 )
 FILE_NAME = re.compile(
-    rf"(?<![\w./\\-])((?:[\w.-]+/)*[\w-][\w.-]*\.(?:{EXTENSIONS}))(?![\w])", re.IGNORECASE
+    rf"(?<![\w./\\-])((?:[\w.-]+/)*[\w-][\w.-]*\.(?:{EXTENSIONS}))(?![\w])",
+    re.IGNORECASE,
 )
 FENCE_BLOCK = re.compile(r"```.*?```", re.DOTALL)
 FENCE_OPEN = re.compile(r"^```(.*)$", re.MULTILINE)
 
 INSPECTION_CLAIM = re.compile(
-    r"\b(?:I(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:just\s+|now\s+|also\s+)?"
-    r"(?:read|reviewed|inspected|examined|opened|looked\s+(?:at|through)|checked|analy[sz]ed|"
-    r"gone\s+through|went\s+through|scanned|studied)\b"
+    r"\b(?:I(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+"
+    r"(?:just\s+|now\s+|also\s+)?"
+    r"(?:read|reviewed|inspected|examined|opened|looked\s+(?:at|through)|"
+    r"checked|analy[sz]ed|gone\s+through|went\s+through|scanned|studied)\b"
     r"|\bafter\s+(?:reading|reviewing|inspecting|examining|checking)\b",
     re.IGNORECASE,
 )
 TEST_CLAIM = re.compile(
     r"\b(?:all\s+(?:\d+\s+)?tests?\s+(?:now\s+)?pass(?:ed|es)?"
-    r"|tests?\s+(?:now\s+|all\s+)?(?:pass(?:ed|es)?|are\s+(?:now\s+)?passing|succeed(?:ed)?)"
-    r"|build\s+(?:succeeded|passes|passed|is\s+successful|was\s+successful))\b",
+    r"|tests?\s+(?:now\s+|all\s+)?(?:pass(?:ed|es)?|are\s+(?:now\s+)?passing|"
+    r"succeed(?:ed)?)|build\s+(?:succeeded|passes|passed|is\s+successful|was\s+successful))\b",
     re.IGNORECASE,
 )
 HEDGE = re.compile(
-    r"\b(?:should|would|will|might|may|could|if|whether|once|until|so\s+that|to\s+(?:see|check|verify|confirm)|"
-    r"make\s+sure|ensure|expect|hope|want|until|when)\b",
+    r"\b(?:should|would|will|might|may|could|if|whether|once|until|so\s+that|"
+    r"to\s+(?:see|check|verify|confirm)|make\s+sure|ensure|expect|hope|want|when)\b",
     re.IGNORECASE,
 )
+
+SOURCE_EVIDENCE_REQUEST = re.compile(
+    r"\b(?:evidence\s+table|exact\s+file\s+paths?|exact\s+function\s+names?|"
+    r"code\s+excerpts?|quotations?|quote\s+proving|read\s+the\s+actual|"
+    r"actual\s+implementations?|not\s+found|trace\s+.*request)\b",
+    re.IGNORECASE,
+)
+
+
+def requires_source_evidence(user_message):
+    """True for requests that require source-backed paths, names, or quotations."""
+    return bool(SOURCE_EVIDENCE_REQUEST.search(user_message or ""))
 
 
 def _basename(path):
     return PurePosixPath(path.replace("\\", "/")).name.lower()
+
+
+def _clean_cell(value):
+    value = value.strip()
+    value = re.sub(r"^\s*`+|`+\s*$", "", value)
+    value = re.sub(r"^\s*\*\*|\*\*\s*$", "", value)
+    return value.strip().strip("\"'")
+
+
+def _normalise_source(value):
+    """Normalise whitespace so wrapped source lines can still be compared."""
+    return " ".join((value or "").split())
+
+
+def _unhedged(text, start):
+    return not HEDGE.search(text[max(0, start - 40):start])
 
 
 def prose_only(answer):
@@ -49,7 +74,7 @@ def prose_only(answer):
 
 
 def proposed_paths(answer):
-    """Paths the answer puts on code fences: new or replacement files it is offering."""
+    """Paths on code fences that are being offered as new/replacement files."""
     paths = set()
     for info in FENCE_OPEN.findall(answer):
         for token in info.replace(":", " ").split():
@@ -59,14 +84,126 @@ def proposed_paths(answer):
     return paths
 
 
-def _unhedged(text, start):
-    return not HEDGE.search(text[max(0, start - 40):start])
+def _read_sources(evidence):
+    """Return source text actually supplied by read tools, keyed by exact path."""
+    sources = {}
+    for record in evidence or []:
+        if record.get("tool") != "read_project_file":
+            continue
+        path = record.get("path")
+        source = record.get("source_text")
+        if path and isinstance(source, str):
+            sources[path.replace("\\", "/")] = source
+    return sources
+
+
+def _table_rows(answer):
+    """Find a Markdown evidence table and return (header-index-map, data-rows)."""
+    lines = answer.splitlines()
+    for start, line in enumerate(lines):
+        if not line.strip().startswith("|"):
+            continue
+
+        headers = [_clean_cell(c).lower() for c in line.strip().strip("|").split("|")]
+        if not any("role" in h for h in headers):
+            continue
+        if not any("path" in h for h in headers):
+            continue
+        if not any("function" in h for h in headers):
+            continue
+
+        indexes = {
+            "path": next(i for i, h in enumerate(headers) if "path" in h),
+            "function": next(i for i, h in enumerate(headers) if "function" in h),
+            "excerpt": next(
+                (i for i, h in enumerate(headers)
+                 if any(word in h for word in ("excerpt", "quotation", "quote", "proof"))),
+                None,
+            ),
+        }
+
+        rows = []
+        for data_line in lines[start + 1:]:
+            stripped = data_line.strip()
+            if not stripped.startswith("|"):
+                if rows:
+                    break
+                continue
+
+            cells = [_clean_cell(c) for c in stripped.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells):
+                continue
+            if len(cells) < len(headers):
+                cells += [""] * (len(headers) - len(cells))
+            rows.append(cells)
+
+        return indexes, rows
+
+    return None, []
+
+
+def _function_is_defined(name, source):
+    """Conservative check for common Python, JS/TS, Java and similar declarations."""
+    if not name or not re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+        return False
+
+    escaped = re.escape(name)
+    patterns = [
+        rf"(?m)^\s*(?:async\s+)?def\s+{escaped}\s*\(",             # Python
+        rf"(?m)^\s*class\s+{escaped}\b",                           # classes
+        rf"(?m)^\s*(?:export\s+)?(?:default\s+)?function\s+\*?{escaped}\s*\(",
+        rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{escaped}\s*=",  # JS/TS
+        rf"(?m)^\s*(?:(?:public|private|protected|static|final|abstract|async|override)\s+)*"
+        rf"[\w<>\[\],.?]+\s+{escaped}\s*\(",                       # common methods
+    ]
+    return any(re.search(pattern, source) for pattern in patterns)
+
+
+def _verify_evidence_table(answer, project_files, evidence):
+    notes = []
+    indexes, rows = _table_rows(answer)
+    if indexes is None or not rows:
+        return ["The request requires an evidence table, but no readable evidence table was provided."]
+
+    exact_files = {p.replace("\\", "/") for p in project_files}
+    sources = _read_sources(evidence)
+
+    for row_number, cells in enumerate(rows, start=1):
+        path = cells[indexes["path"]].replace("\\", "/")
+        function = cells[indexes["function"]]
+        excerpt_index = indexes["excerpt"]
+        excerpt = cells[excerpt_index] if excerpt_index is not None else ""
+
+        if path.upper() == "NOT FOUND":
+            if function and function.upper() != "NOT FOUND":
+                notes.append(f"Evidence table row {row_number} names a function despite its file being NOT FOUND.")
+            continue
+
+        if path not in exact_files:
+            notes.append(f"Evidence table row {row_number} names `{path}`, which is not an exact path in the attached project.")
+            continue
+
+        source = sources.get(path)
+        if source is None:
+            notes.append(f"Evidence table row {row_number} uses `{path}`, but the backend has no source text from a file read to verify it.")
+            continue
+
+        if function.upper() != "NOT FOUND":
+            if not _function_is_defined(function, source):
+                notes.append(f"Evidence table row {row_number} names `{function}`, but that declaration was not found in `{path}`.")
+
+        if excerpt and excerpt.upper() != "NOT FOUND":
+            if _normalise_source(excerpt) not in _normalise_source(source):
+                notes.append(f"Evidence table row {row_number} has an excerpt that does not match the source read from `{path}`.")
+
+    return notes
 
 
 def check_answer(answer, project_files, user_message, evidence):
-    """Return a list of short, plain-English problems found in the answer (maybe empty)."""
+    """Return deterministic warnings for unsupported claims."""
+    strict = requires_source_evidence(user_message or "")
     if not project_files:
-        return []
+        return ["No project files were available to verify this source-evidence request."] if strict else []
 
     notes = []
     prose = prose_only(answer)
@@ -87,8 +224,7 @@ def check_answer(answer, project_files, user_message, evidence):
     existing = []
     for name in mentioned:
         base = _basename(name)
-        exists = name in project_files or base in by_basename
-        if exists:
+        if name in project_files or base in by_basename:
             existing.append(name)
         elif base not in offered and base not in user_text:
             missing.append(name)
@@ -96,8 +232,8 @@ def check_answer(answer, project_files, user_message, evidence):
     if missing:
         names = ", ".join(f"`{n}`" for n in missing[:5])
         notes.append(
-            f"It mentions {names}, which is not in the attached project. If it is proposing a "
-            "new file that is fine; if it is describing existing code, that part is invented."
+            f"It mentions {names}, which is not in the attached project. "
+            "If describing existing code, that part is unsupported."
         )
 
     read = files_read(evidence)
@@ -108,19 +244,14 @@ def check_answer(answer, project_files, user_message, evidence):
         if unread:
             names = ", ".join(f"`{n}`" for n in unread[:5])
             notes.append(
-                f"It talks about having looked at {names}, but it never opened "
-                f"{'that file' if len(unread) == 1 else 'those files'}. Ask it to read "
-                f"{'it' if len(unread) == 1 else 'them'} first before trusting the details."
+                f"It claims to have inspected {names}, but those files were not recorded as read."
             )
         elif not existing and not read:
-            notes.append(
-                "It says it reviewed the project, but it did not open any file in this "
-                "conversation. Treat file-specific details as unverified."
-            )
+            notes.append("It claims to have reviewed the project, but no file was recorded as read.")
 
     claim = next((m for m in TEST_CLAIM.finditer(prose) if _unhedged(prose, m.start())), None)
     if claim:
-        status, summary = last_test_status(evidence)
+        status, _ = last_test_status(evidence)
         if status != "passed":
             words = {
                 "never_run": "no tests have been run",
@@ -132,7 +263,13 @@ def check_answer(answer, project_files, user_message, evidence):
             }.get(status, status)
             notes.append(f"It says tests pass, but {words}.")
 
-    return notes
+    if strict:
+        if not any(r.get("tool") == "read_project_file" for r in (evidence or [])):
+            notes.append("No project file was actually read for this source-evidence request.")
+        notes.extend(_verify_evidence_table(answer, project_files, evidence))
+
+    # Keep the returned warnings unique and in their original order.
+    return list(dict.fromkeys(notes))
 
 
 def format_notes(notes):

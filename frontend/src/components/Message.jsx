@@ -3,7 +3,7 @@ import Markdown from "./Markdown";
 import { WORDMARK } from "../brand";
 import { copyText } from "../lib/download";
 import { blocksToFiles, extractCodeBlocks } from "../lib/markdown";
-import { IconCheck, IconCopy, IconDownload, IconFolder, IconRefresh, IconWrench } from "./Icons";
+import { IconCheck, IconCopy, IconDownload, IconRefresh, IconWrench } from "./Icons";
 
 // A small compass needle that swings while Atlas is working.
 function Needle() {
@@ -40,26 +40,21 @@ function UserMessage({ message }) {
   );
 }
 
-function FileBar({ files, project, onZip, onApply }) {
-  const applicable = files.filter((f) => f.hasPath);
+function FileBar({ files, onZip }) {
   return (
     <div className="filebar">
       <span className="filebar-label">
         {files.length} file{files.length === 1 ? "" : "s"} in this reply
       </span>
+
       <button type="button" onClick={() => onZip(files)}>
         <IconDownload /> Download .zip
       </button>
-      {project && applicable.length > 0 && (
-        <button type="button" onClick={() => onApply(applicable)} title="Replaces whole files in the attached project (a backup is kept)">
-          <IconFolder /> Apply {applicable.length} to project
-        </button>
-      )}
     </div>
   );
 }
 
-function AssistantMessage({ message, isLast, busy, project, onRegenerate, onZip, onApply }) {
+function AssistantMessage({ message, isLast, busy, onRegenerate, onZip}) {
   const [copied, setCopied] = useState(false);
   const meta = message.meta || {};
   const done = !message.streaming;
@@ -127,7 +122,7 @@ function AssistantMessage({ message, isLast, busy, project, onRegenerate, onZip,
         )}
 
         {done && showFiles && (
-          <FileBar files={files} project={project} onZip={onZip} onApply={onApply} />
+          <FileBar files={files}  onZip={onZip}/>
         )}
 
         {done && message.content && (

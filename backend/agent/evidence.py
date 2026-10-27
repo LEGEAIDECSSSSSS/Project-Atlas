@@ -85,6 +85,8 @@ def records_from_tool(tool_name, arguments, result):
             "of": result.get("total_lines"),
             "complete": not result.get("truncated"),
             "outline": outline(result.get("content", "")),
+            # Keep a bounded copy so strict evidence checks can validate source excerpts.
+            "source_text": result.get("content", "")[:12000],
         }]
 
     if tool_name == "search_project":
@@ -103,6 +105,8 @@ def records_from_tool(tool_name, arguments, result):
                 "of": None,
                 "complete": "[File content truncated" not in content,
                 "outline": outline(content),
+                # This content came from the actual automatically-read source file.
+                "source_text": content[:12000],
             })
         return records
 

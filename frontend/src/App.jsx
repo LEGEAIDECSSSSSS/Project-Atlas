@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  applyFiles, deleteConversation, getConversation, getHealth, listConversations,
+  deleteConversation, getConversation, getHealth, listConversations,
   projectZipUrl, renameConversation, streamChat, uploadFiles, uploadProject, zipFiles,
 } from "./api";
 import { APP_NAME } from "./brand";
@@ -294,26 +294,6 @@ export default function App() {
     }
   }
 
-  async function applyToProject(files) {
-    if (!project) return;
-    const payload = files.map(({ path, content }) => ({ path, content }));
-    try {
-      const plan = await applyFiles(project.id, payload, true);
-      const lines = plan.files.map((f) =>
-        f.status === "created"
-          ? `• ${f.path} — new file`
-          : `• ${f.path} — replaces existing (${f.old_lines} → ${f.new_lines} lines)${f.shrunk ? "  ⚠ much shorter than before" : ""}`,
-      );
-      const ok = window.confirm(
-        `Apply ${files.length} file${files.length === 1 ? "" : "s"} to the project?\n\n${lines.join("\n")}\n\nReplaced files are backed up first.`,
-      );
-      if (!ok) return;
-      await applyFiles(project.id, payload, false);
-      toast("Applied. Use the download icon on the project chip to get the updated ZIP.");
-    } catch (error) {
-      toast(error.message, "error");
-    }
-  }
 
   // ---- drag & drop -------------------------------------------------------
   const dragProps = {
@@ -432,7 +412,6 @@ export default function App() {
                   project={project}
                   onRegenerate={retry}
                   onZip={downloadZip}
-                  onApply={applyToProject}
                 />
               ))}
             </div>

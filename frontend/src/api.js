@@ -47,9 +47,6 @@ export function uploadFiles(files, projectId) {
   return request("/upload-files", { method: "POST", body: form }).then((r) => r.json());
 }
 
-export const applyFiles = (projectId, files, dryRun = false) =>
-  request(`/projects/${projectId}/apply`, json({ files, dry_run: dryRun })).then((r) => r.json());
-
 export const zipFiles = (files, name) =>
   request("/download-zip", json({ files, name })).then((r) => r.blob());
 

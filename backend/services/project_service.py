@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import config
+from services import db
 from services.locks import project_lock
 
 WORKSPACE = config.WORKSPACE_DIR
@@ -363,6 +364,11 @@ def _add_uploaded_files(uploads, project_id):
             raise ValueError("No usable files were uploaded.")
 
         _commit_staged(staged)
+
+        # New or replaced files invalidate approval for running this project's tests.
+        # A newly created project has no previous approval to revoke.
+        if not created:
+            db.set_tests_approved(project_id, False)
 
     except Exception:
         for temporary, _ in staged:

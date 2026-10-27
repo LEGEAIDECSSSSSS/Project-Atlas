@@ -28,9 +28,10 @@ On Windows, `start.bat` in this folder does steps 2 and 3 and opens the browser.
 - **Paste code** straight into the box, or click the paperclip / drag and drop:
   a **.zip** project, or loose code files. Big junk folders (`node_modules`, `.venv`, `.git`,
   `build`, `target`...) are skipped automatically.
-- **Getting files back**: when a reply contains code, each block has Copy and Download. If the model
-  names the file path, the reply gets **Download .zip** and, with a project attached,
-  **Apply to project**. Apply shows what it will replace, backs up the old files
+- - **Getting files back**: when a reply contains code, each block has Copy and
+  Download. Replies containing generated files also offer **Download .zip**.
+  Downloaded files are separate from your attached project. Atlas never applies
+  generated code directly to the project.
   (`data/backups/`), and keeps Windows line endings. The paperclip chip downloads the whole
   updated project as a ZIP.
 - **Lists and totals**: the model uses an exact calculator tool instead of doing arithmetic itself.
@@ -74,7 +75,6 @@ logo is a placeholder), `<title>` in `frontend/index.html`. Backend: `LC_APP_NAM
 
 - A 7B model is a 7B model: it is decent for everyday tasks and focused code fixes, but it will not
   match a large cloud model on big refactors. Keep requests focused.
-- "Apply to project" replaces whole files (only blocks the model labelled with a path). Partial
   edits via search/replace patches would be a good next step for large files.
 - `run_project_tests` still supports Maven only. Adding `pytest` / `npm test` is straightforward.
 - No web access, no image input. A very large pasted file is cut to fit the context (you get a warning);

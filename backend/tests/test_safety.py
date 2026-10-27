@@ -583,3 +583,29 @@ def test_other_window_sizes_still_leave_room_for_the_conversation(window, compac
     assert result["compact"] is compact
     assert result["system"] <= result["budget"] * 0.75
     assert result["budget"] - result["system"] >= 700                      # real room left to talk
+
+def test_uploading_files_revokes_previous_test_approval(client):
+    from services import db
+
+    project_id = upload(client, POM)["project_id"]
+
+    # Explicitly approve running this project's tests.
+    response = client.post(
+        f"/projects/{project_id}/tests-approval",
+        json={"approved": True},
+    )
+    assert response.status_code == 200
+    assert db.tests_approved(project_id) is True
+
+    # Add a file to the existing project.
+    response = client.post(
+        "/upload-files",
+        data={"project_id": project_id},
+        files=[
+            ("files", ("src/New.java", b"class New {}")),
+        ],
+    )
+    assert response.status_code == 200, response.text
+
+    # The old approval must no longer be valid.
+    assert db.tests_approved(project_id) is False
