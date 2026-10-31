@@ -649,3 +649,57 @@ code, .user-text, .composer textarea { font-variant-ligatures: none; } /* show =
     letter-spacing: .03em;
   }
 }
+
+/* Verified 14-inch laptop layout: 1366x768 viewport, desktop sidebar retained. */
+@media screen and (min-width: 701px) and (max-width: 1450px) and (max-height: 820px) {
+  .welcome {
+    height: auto;
+    min-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    display: block;
+    padding: 14px clamp(22px, 3.2vw, 42px) 14px;
+  }
+  .welcome-inner {
+    height: auto;
+    min-height: 0;
+    max-width: 1120px;
+    justify-content: flex-start;
+    margin: 0 auto;
+  }
+  .welcome-eyebrow { padding-bottom: 8px; }
+  .welcome-hero {
+    flex: none;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(245px, .78fr);
+    align-items: center;
+    gap: clamp(12px, 2vw, 26px);
+    padding: 12px 0 10px;
+  }
+  .welcome-copy { min-width: 0; padding: 0; }
+  .welcome-brand { font-size: 13px; }
+  .welcome .kicker { margin-top: 9px; font-size: 9px; }
+  .wordmark-xl {
+    margin-top: 10px;
+    font-size: clamp(38px, 4.1vw, 54px);
+    line-height: 1.02;
+  }
+  .welcome-description { max-width: 390px; margin-top: 12px; font-size: 13px; line-height: 1.5; }
+  .welcome-identity { margin-top: 12px; font-size: 9px; }
+  .core-stage {
+    width: 100%;
+    max-height: min(36vh, 300px);
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+  }
+  .core-visual { width: min(100%, 330px); max-height: 100%; }
+  .core-coordinate, .core-side-note { font-size: 8px; }
+  .welcome-lower { gap: 18px; padding: 14px 0 10px; }
+  .compact-starters { padding: 8px 0 5px; }
+  .compact-starters .section-heading { padding-bottom: 5px; }
+  .compact-starters .starters { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 18px; }
+  .compact-starters .starters button { min-height: 42px; padding: 5px 0; }
+  .compact-starters .starter-copy strong { font-size: 12px; }
+  .compact-starters .starter-copy small { font-size: 10px; }
+  .compact-footer { padding-top: 6px; font-size: 8px; }
+}
