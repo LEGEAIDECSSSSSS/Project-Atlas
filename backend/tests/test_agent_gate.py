@@ -1,78 +1,24 @@
-"""Tests for backend/agent/agent.py (tool gating, retrieval tracking, grounding).
+"""Tests for backend/agent/agent.py: tool gating, retrieval tracking, investigation, verification.
 
-Run from the backend folder:   python -m unittest test_agent_gate -v
-(copy this file next to `agent/` or into backend/tests and adjust as you like).
-
-The tests never call Ollama or touch real projects: the model, the project service and
-the file system are replaced with in-memory fakes. If the real `agent` package cannot be
-imported (for example when this file is run on its own), small stand-ins are used for
-the modules agent.py depends on (config, context, evidence, prompts, verify, services).
+Run from the backend folder:   python -m pytest tests/test_agent_gate.py
+The model is replaced by a scripted fake; projects are real (small) folders created in the test
+workspace, so search, the code index and the file tools are the real thing.
 """
 import asyncio
 import contextlib
-import importlib.util
 import io
 import json
-import os
-import sys
-import types
+import shutil
 import unittest
+import uuid
 from unittest import mock
 
+import config
+from agent import agent as A
+from services import code_index
+from services import project_service as ps
 
-def load_agent():
-    try:
-        from agent import agent as module  # the real project
-        return module
-    except Exception:
-        pass
-
-    def mod(name, **attrs):
-        m = types.ModuleType(name)
-        m.__dict__.update(attrs)
-        sys.modules[name] = m
-        return m
-
-    mod("config", MAX_TOOL_CALLS=3, MAX_FILE_CHARS=4000, NUM_CTX=8192, NUM_PREDICT=1024,
-        COMPACT_PROMPTS=False, APP_NAME="Atlas", CODE_MODEL="code", CHAT_MODEL="chat",
-        TEMPERATURE_CODE=0.1, TEMPERATURE_CHAT=0.5)
-    pkg = mod("agent")
-    pkg.__path__ = []
-    mod("agent.context", estimate_tokens=lambda text: len(text) // 4,
-        fit_messages=lambda messages: (messages, []))
-    evidence = mod(
-        "agent.evidence",
-        records_from_tool=lambda tool, args, result: [{"tool": tool, "ok": not (
-            isinstance(result, dict) and result.get("error"))}],
-        render_block=lambda records: "",
-        merge=lambda lists: [r for sub in lists for r in sub],
-        test_status=lambda result: "passed",
-    )
-    pkg.evidence = evidence
-    mod("agent.prompts", CHAT_PROMPT="You are {app_name}. Today is {today}.",
-        CODE_OUTPUT_RULES="code rules", GROUNDING_RULES="grounding rules",
-        SYSTEM_PROMPT="system", SYSTEM_PROMPT_COMPACT="system compact")
-    mod("agent.verify", check_answer=lambda *a, **k: [], format_notes=lambda n: "\n" + "\n".join(n),
-        requires_source_evidence=lambda m: False)
-    mod("services")
-    mod("services.calculator", calculate=lambda expression=None, expressions=None: {"total": 0})
-    mod("services.ollama", stream_chat=None)
-    mod("services.project_service", list_project_files=lambda p: [],
-        read_project_file=lambda p, path: "", search_project=lambda project_id, query: {})
-    mod("services.test_runner", run_project_tests=lambda project_id: {})
-
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [os.path.join(here, "agent.py"), os.path.join(here, "agent", "agent.py")]
-    path = next(p for p in candidates if os.path.exists(p))
-    spec = importlib.util.spec_from_file_location("agent.agent", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent.agent"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-A = load_agent()
-
+DEFAULT = object()
 PROJECT = "proj-1"
 LINES100 = "\n".join(f"line {i}" for i in range(1, 101))
 INJECTION = (
@@ -96,33 +42,29 @@ def default_files():
 
 
 class World:
-    """An in-memory project."""
+    """A real project folder in the test workspace."""
 
     def __init__(self, files=None):
         self.files = default_files() if files is None else files
-        self.search_project_ids = []
-
-    def list(self, project_id):
-        return list(self.files)
-
-    def read(self, project_id, path):
-        if path not in self.files:
-            raise FileNotFoundError(f"No such file: {path}")
-        return self.files[path]
-
-    def search(self, project_id, query):
-        self.search_project_ids.append(project_id)
-        terms = [t.strip().lower() for t in query.split("|") if t.strip()]
-        results = []
+        self.project_id = str(uuid.uuid4())
+        self.root = config.WORKSPACE_DIR / self.project_id
+        self.root.mkdir(parents=True, exist_ok=True)
         for path, content in self.files.items():
-            hits = [line for line in content.splitlines()
-                    if any(t in line.lower() for t in terms)]
-            if hits or any(t in path.lower() for t in terms):
-                results.append({
-                    "path": path, "matches": hits, "match_count": len(hits),
-                    "filename_match": any(t in path.lower() for t in terms),
-                })
-        return {"project_id": project_id, "query": query, "results": results}
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        self.search_project_ids = []
+        self.list = ps.list_project_files
+        self.read = ps.read_project_file
+        self._search = ps.search_project
+
+    def search(self, project_id, query, limit=20, offset=0):
+        self.search_project_ids.append(project_id)
+        return self._search(project_id, query, limit, offset)
+
+    def close(self):
+        code_index.clear_cache(self.project_id)
+        shutil.rmtree(self.root, ignore_errors=True)
 
 
 class FakeModel:
@@ -173,30 +115,35 @@ class Outcome:
         return len(self.model.calls)
 
 
-def run(message, responses=(), files=None, mode="chat", project_id=PROJECT, history=None,
-        tests_approved=False, chunk=7, max_calls=None, extra_patches=None, world=None):
+def run(message, responses=(), files=None, mode="chat", project_id=DEFAULT, history=None,
+        tests_approved=False, chunk=7, max_calls=None, extra_patches=None, world=None, close=True):
     world = world or World(files)
+    pid = world.project_id if project_id is DEFAULT else project_id
     model = FakeModel(responses, chunk)
 
     async def go():
         events = []
         async for event in A.run_agent_stream(
-            message, history=history, project_id=project_id, mode=mode,
+            message, history=history, project_id=pid, mode=mode,
             tests_approved=tests_approved,
         ):
             events.append(event)
         return events
 
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(mock.patch.object(A, "list_project_files", world.list))
-        stack.enter_context(mock.patch.object(A, "_read_project_file", world.read))
-        stack.enter_context(mock.patch.object(A, "stream_chat", model))
-        stack.enter_context(mock.patch.dict(A.TOOL_FUNCTIONS, {"search_project": world.search}))
-        if max_calls is not None:
-            stack.enter_context(mock.patch.object(A, "MAX_TOOL_CALLS", max_calls))
-        for target, name, value in (extra_patches or []):
-            stack.enter_context(mock.patch.object(target, name, value))
-        events = asyncio.run(asyncio.wait_for(go(), 20))
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(A, "list_project_files", world.list))
+            stack.enter_context(mock.patch.object(A, "_read_project_file", world.read))
+            stack.enter_context(mock.patch.object(A, "stream_chat", model))
+            stack.enter_context(mock.patch.dict(A.TOOL_FUNCTIONS, {"search_project": world.search}))
+            if max_calls is not None:
+                stack.enter_context(mock.patch.object(A, "MAX_TOOL_CALLS", max_calls))
+            for target, name, value in (extra_patches or []):
+                stack.enter_context(mock.patch.object(target, name, value))
+            events = asyncio.run(asyncio.wait_for(go(), 30))
+    finally:
+        if close:
+            world.close()
 
     return Outcome(events, model, world)
 
@@ -444,6 +391,62 @@ class TrackerTests(unittest.TestCase):
         t.record("search_project", {"results": []})  # "no matches" is an answer
         self.assertTrue(t.satisfied())
 
+    def test_resumed_search_must_continue_the_returned_cursor(self):
+        req = A.Requirement(kind="search")
+        t = A.RetrievalTracker(req)
+        # A completed suffix alone is not a complete project scan.
+        t.record("search_project", {"query": "needle", "results": [], "total_files": 0,
+                                     "scan_after": "a.py", "scan_cursor": "z.py",
+                                     "scan_truncated": False})
+        self.assertFalse(t.satisfied())
+
+        # A fresh timed-out prefix followed by its exact cursor is exhaustive.
+        t = A.RetrievalTracker(req)
+        t.record("search_project", {"query": "needle", "results": [], "total_files": 0,
+                                     "scan_after": None, "scan_cursor": "b.py",
+                                     "scan_truncated": True})
+        self.assertFalse(t.satisfied())
+        t.record("search_project", {"query": "needle", "results": [], "total_files": 0,
+                                     "scan_after": "b.py", "scan_cursor": "z.py",
+                                     "scan_truncated": False})
+        self.assertTrue(t.satisfied())
+        self.assertTrue(t.nothing_found)
+
+    def test_unrelated_resume_cursor_does_not_complete_search(self):
+        t = A.RetrievalTracker(A.Requirement(kind="search"))
+        t.record("search_project", {"query": "needle", "results": [], "total_files": 0,
+                                     "scan_after": None, "scan_cursor": "b.py",
+                                     "scan_truncated": True})
+        t.record("search_project", {"query": "needle", "results": [], "total_files": 0,
+                                     "scan_after": "c.py", "scan_cursor": "z.py",
+                                     "scan_truncated": False})
+        self.assertFalse(t.satisfied())
+        self.assertFalse(t.nothing_found)
+
+    def test_structural_lookup_can_satisfy_matching_named_analysis(self):
+        t = A.RetrievalTracker(A.Requirement(kind="analyze", terms=["authenticate_user"]))
+        result = {"name": "authenticate_user", "test_files": [],
+                  "likely_tests_by_file_name": [], "note": "No test file mentions this name."}
+        self.assertTrue(t.record("find_tests_for_symbol", result))
+        self.assertTrue(t.satisfied())
+
+    def test_explore_rejects_empty_search_and_empty_index_results(self):
+        t = A.RetrievalTracker(A.Requirement(kind="explore"))
+        t.record("search_project", {"query": "overview", "results": [],
+                                     "scan_truncated": True, "scan_after": None,
+                                     "scan_cursor": "a.py"})
+        self.assertFalse(t.satisfied())
+        t.record("find_entry_points", {"entry_points": []})
+        self.assertFalse(t.satisfied())
+
+    def test_explore_accepts_real_source_or_structural_records(self):
+        t = A.RetrievalTracker(A.Requirement(kind="explore"))
+        t.record("find_entry_points", {"entry_points": [{"path": "main.py", "name": "main"}]})
+        self.assertTrue(t.satisfied())
+        t = A.RetrievalTracker(A.Requirement(kind="explore"))
+        t.record("read_project_file", read_result("main.py", 1, 2))
+        self.assertTrue(t.satisfied())
+
     def test_analyze_needs_relevant_source(self):
         req = A.Requirement(kind="analyze", terms=["run_agent_stream"])
         t = A.RetrievalTracker(req)
@@ -570,7 +573,7 @@ class ValidationTests(unittest.TestCase):
         system = {"role": "system", "content": "SYS"}
         request = {"role": "user", "content": "REQUEST"}
         newest = {"role": "user", "content": "NEWEST"}
-        with mock.patch.object(A, "fit_messages", lambda m: ([{"role": "assistant", "content": "x"}], ["n"])):
+        with mock.patch.object(A, "fit_messages", lambda m, **kw: ([{"role": "assistant", "content": "x"}], ["n"])):
             fitted, notes = A.pinned_fit([system, request, newest], (system, request, newest))
         self.assertEqual(fitted[0], system)
         self.assertIn(request, fitted)
@@ -580,49 +583,6 @@ class ValidationTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # Grounding
-# ---------------------------------------------------------------------------
-
-class GroundingTests(unittest.TestCase):
-    def tracker(self):
-        t = A.RetrievalTracker(None)
-        t.record("read_project_file", read_result("a.py", 1, 10, total=10))
-        return t
-
-    def test_test_claims(self):
-        t = self.tracker()
-        known = ["a.py"]
-        for claim in ["All tests passed.", "I ran the tests and they pass.", "The build succeeded."]:
-            self.assertTrue(A.check_grounding(claim, t, known)[0], claim)
-        for fine in ["I did not run the tests.", "Once the tests pass, merge it.",
-                     "If the tests fail, check the logs.", "The tests were NOT run.",
-                     "You should make sure the tests pass."]:
-            self.assertFalse(A.check_grounding(fine, t, known)[0], fine)
-
-    def test_test_claim_allowed_with_real_results(self):
-        t = self.tracker()
-        t.record("run_project_tests", {"status": "ok", "output": "ok"})
-        self.assertFalse(A.check_grounding("All tests passed.", t, ["a.py"])[0])
-        t2 = self.tracker()
-        self.assertFalse(A.check_grounding("All tests passed.", t2, ["a.py"],
-                                           [{"tool": "run_project_tests"}])[0])
-
-    def test_line_reference_beyond_file_is_flagged(self):
-        t = self.tracker()
-        hard, soft = A.check_grounding("The bug is on line 500.", t, ["a.py"])
-        self.assertFalse(hard)
-        self.assertTrue(any("line 500" in s for s in soft))
-        self.assertFalse(A.check_grounding("See lines 2-9.", t, ["a.py"])[1])
-
-    def test_unknown_files_are_flagged_but_code_blocks_ignored(self):
-        t = self.tracker()
-        soft = A.check_grounding("Edit `ghost.py` next.", t, ["a.py"])[1]
-        self.assertTrue(any("ghost.py" in s for s in soft))
-        self.assertFalse(A.check_grounding("```\nimport ghost.py\n```", t, ["a.py"])[1])
-        self.assertFalse(A.check_grounding("Edit a.py next.", t, ["a.py"])[1])
-
-
-# ---------------------------------------------------------------------------
-# The whole loop
 # ---------------------------------------------------------------------------
 
 class LoopTests(unittest.TestCase):
@@ -658,7 +618,7 @@ class LoopTests(unittest.TestCase):
         files["big.py"] = "\n".join(f"line {i} " + "x" * 80 for i in range(1, 501))
         out = run("Show big.py", files=files)
         self.assertIn("cut at the size limit", out.text)
-        self.assertIn("of 500", out.text)
+        self.assertIn("500 lines", out.text)
 
     def test_empty_file(self):
         out = run("Show empty.py")
@@ -747,34 +707,47 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(out.model_calls, 1)
         self.assertIn("backend/agent/agent.py", json.dumps(out.model.calls[0]))
 
-    # -- unnamed analysis / search: the model must use tools ---------------------------
+    # -- broad questions: Atlas investigates; where it cannot, the model must use tools -----
+    def test_atlas_investigates_before_the_model_answers(self):
+        out = run("Explain the run_agent_stream method", ["It is declared in Main.java."])
+        self.assertEqual(out.model_calls, 1)
+        self.assertEqual(out.text, "It is declared in Main.java.")
+        labels = [t["label"] for t in out.tools]
+        self.assertTrue(any(l.startswith("Looked up definition of run_agent_stream") for l in labels))
+        self.assertTrue(any(l.startswith("Searched project for") for l in labels))
+        seen = json.dumps(out.model.calls[0])
+        self.assertIn("ATLAS INVESTIGATION", seen)
+        self.assertIn("void run_agent_stream", seen)          # the real definition was read for it
+
     def test_model_that_skips_tools_is_nudged_then_fails_cleanly(self):
-        out = run("Explain the run_agent_stream method", ["It does X."] * 3)
+        # nothing specific to search for, so Atlas cannot investigate on the model's behalf
+        out = run("Find where the thing is defined", ["It does X."] * 3)
         self.assertEqual(out.model_calls, 3)  # first try + 2 nudges
         self.assertIn("could not complete", out.text)
         self.assertNotIn("It does X.", out.text)
         self.assertNotIn("It does X.", out.streamed)
 
     def test_model_that_complies_after_a_nudge_succeeds(self):
-        out = run("Explain the run_agent_stream method",
+        out = run("Find where the thing is defined",
                   ["It does X.", SEARCH_RUN, "It is declared in Main.java."])
         self.assertEqual(out.text, "It is declared in Main.java.")
         self.assertIn("TOOL REQUIRED", json.dumps(out.model.calls[1]))
 
-    def test_listing_cannot_unlock_a_source_question(self):
-        out = run("Explain the run_agent_stream method",
+    def test_listing_cannot_unlock_a_search_request(self):
+        out = run("Find where the thing is defined",
                   [tool_json("list_project_files"), "answer", "answer", "answer"])
         self.assertIn("could not complete", out.text)
         self.assertNotIn("answer", out.text.replace("answer was given", ""))
 
-    def test_unrelated_search_cannot_unlock_a_source_question(self):
-        out = run("Explain the run_agent_stream method",
-                  [tool_json("search_project", query="Dockerfile"), "answer", "answer", "answer"])
-        self.assertIn("could not complete", out.text)
+    def test_two_empty_searches_make_not_found_a_supported_answer(self):
+        out = run("Explain the zzz_missing_function method",
+                  ["I could not find zzz_missing_function anywhere in the project."])
+        self.assertEqual(out.model_calls, 1)
+        self.assertIn("could not find", out.text)
+        self.assertIn("-> 0 file(s)", json.dumps(out.model.calls[0]))
 
-    def test_search_request_is_satisfied_by_a_completed_search_even_with_no_matches(self):
-        out = run("Search the project for zzz_nothing_here",
-                  [tool_json("search_project", query="zzz_nothing_here"), "Nothing matched."])
+    def test_search_request_is_answered_even_with_no_matches(self):
+        out = run("Search the project for zzz_nothing_here", ["Nothing matched."])
         self.assertEqual(out.text, "Nothing matched.")
 
     def test_invalid_tool_name_is_repaired(self):
@@ -800,7 +773,7 @@ class LoopTests(unittest.TestCase):
                      SEARCH_RUN, "Found it."]
         out = run("Explain the run_agent_stream method", responses, max_calls=2)
         self.assertEqual(out.text, "Found it.")
-        self.assertEqual([t["ok"] for t in out.tools], [False, False, True])
+        self.assertEqual([t["ok"] for t in out.tools][-3:], [False, False, True])
 
     def test_total_call_budget_is_still_a_hard_limit(self):
         responses = [tool_json("read_project_file")] * 10
@@ -853,19 +826,26 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn("read_project_file: arguments", no_project.model.calls[0][0]["content"])
 
     # -- grounding in both modes ---------------------------------------------------------
-    def test_ungrounded_test_claim_is_withheld_in_chat_mode(self):
+    def test_ungrounded_test_claim_is_flagged_in_chat_mode(self):
         out = run("Explain what backend/agent/verify.py does", ["It works and all tests passed."])
-        self.assertIn("withheld", out.text)
-        self.assertNotIn("all tests passed", out.streamed)
+        self.assertIn("Check this reply before trusting it", out.text)
+        self.assertIn("no tests have been run", out.text)
 
     def test_honest_test_statement_passes(self):
         out = run("Explain what backend/agent/verify.py does", ["I did not run the tests."])
         self.assertEqual(out.text, "I did not run the tests.")
 
-    def test_soft_verification_note_for_impossible_line_numbers(self):
-        out = run("Explain what backend/agent/verify.py does", ["The bug is on line 400."])
-        self.assertIn("The bug is on line 400.", out.text)
-        self.assertIn("Verification notes", out.text)
+    def test_citing_a_line_beyond_the_file_is_flagged(self):
+        out = run("Explain what backend/agent/verify.py does",
+                  ["The bug is at backend/agent/verify.py:400."])
+        self.assertIn("The bug is at backend/agent/verify.py:400.", out.text)
+        self.assertIn("has only 2 lines", out.text)
+
+    def test_an_invented_function_is_flagged_but_a_real_one_is_not(self):
+        out = run("Explain what backend/agent/verify.py does",
+                  ["It calls `ghost_helper_fn` and `check` internally."])
+        self.assertIn("ghost_helper_fn", out.text.split("Check this reply")[-1])
+        self.assertNotIn("`check`", out.text.split("Check this reply")[-1])
 
     def test_code_mode_strict_verification_still_withholds(self):
         patches = [(A, "requires_source_evidence", lambda m: True),
@@ -911,13 +891,13 @@ class LoopTests(unittest.TestCase):
         evil = tool_json("search_project", query="run_agent_stream", project_id="other")
         world = World()
         out = run("Explain the run_agent_stream method", [evil, "Found."], world=world)
-        self.assertEqual(world.search_project_ids, [PROJECT])
-        self.assertEqual(out.done["project_id"], PROJECT)
+        self.assertEqual(set(world.search_project_ids), {world.project_id})
+        self.assertEqual(out.done["project_id"], world.project_id)
 
     def test_model_cannot_traverse_out_of_the_project(self):
         out = run("Explain the run_agent_stream method",
                   [tool_json("read_project_file", path="../../etc/passwd"), SEARCH_RUN, "Found."])
-        self.assertFalse(out.tools[0]["ok"])
+        self.assertTrue([t for t in out.tools if not t["ok"]])
         self.assertIn("..", json.dumps(out.model.calls[1]))
 
     def test_tests_not_approved_are_reported_not_run(self):
@@ -980,9 +960,9 @@ class LoopTests(unittest.TestCase):
         with mock.patch.object(A, "list_project_files", world.list), \
                 mock.patch.object(A, "_read_project_file", world.read), \
                 mock.patch.object(A, "stream_chat", model):
-            result = asyncio.run(A.run_agent("Show Dockerfile", project_id=PROJECT, mode="chat"))
+            result = asyncio.run(A.run_agent("Show Dockerfile", project_id=world.project_id, mode="chat"))
         self.assertIn("FROM python", result["response"])
-        self.assertEqual(result["project_id"], PROJECT)
+        self.assertEqual(result["project_id"], world.project_id)
 
 
 if __name__ == "__main__":

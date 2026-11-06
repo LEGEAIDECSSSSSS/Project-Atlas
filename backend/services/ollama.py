@@ -123,23 +123,42 @@ def _has(installed, name):
     return None
 
 
-async def resolve_model(preferred, alternates=()):
-    """Pick an installed model. Returns (model_name, warning_or_None)."""
+def _allowed(name):
+    low = name.lower()
+    return "embed" not in low and any(pattern in low for pattern in config.MODEL_ALLOWLIST)
+
+
+async def resolve_model(preferred, alternates=(), explicit=False):
+    """Pick an installed model. Returns (model_name, warning_or_None).
+
+    The configured model is used when installed. If it is missing, only the other configured
+    model (`alternates`) may stand in, with a clear warning, and never when the user chose the
+    model explicitly. Atlas does not pick an arbitrary installed model: it lists the compatible
+    ones and lets the user decide.
+    """
     installed = await list_models()
     found = _has(installed, preferred)
     if found:
         return found, None
-    for alt in alternates:
-        found = _has(installed, alt)
-        if found:
-            return found, (
-                f"Model '{preferred}' is not installed, so '{found}' was used instead. "
-                f"For better results run:  ollama pull {preferred}"
-            )
-    usable = [m for m in installed if "embed" not in m.lower()]
-    if usable:
-        return usable[0], (
-            f"Model '{preferred}' is not installed, so '{usable[0]}' was used instead. "
-            f"Install it with:  ollama pull {preferred}"
-        )
-    raise OllamaError(f"No models are installed. Run:  ollama pull {preferred}")
+    if not explicit:
+        for alt in alternates:
+            found = _has(installed, alt)
+            if found:
+                return found, (
+                    f"Model '{preferred}' is not installed, so '{found}' was used instead. "
+                    f"For better results run:  ollama pull {preferred}"
+                )
+
+    if not installed:
+        raise OllamaError(f"No models are installed. Run:  ollama pull {preferred}")
+
+    options = [m for m in installed if _allowed(m)]
+    advice = (
+        f" Compatible models you already have: {', '.join(options[:6])}. "
+        "Choose one in the model menu to continue."
+        if options else " None of your installed models is on the supported list."
+    )
+    raise OllamaError(
+        f"Model '{preferred}' is not installed.{advice} "
+        f"Or install it with:  ollama pull {preferred}"
+    )

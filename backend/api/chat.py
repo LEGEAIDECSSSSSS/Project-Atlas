@@ -121,7 +121,7 @@ async def _run_chat(request: ChatRequest):
     try:
         preferred = request.model or (config.CODE_MODEL if mode == "code" else config.CHAT_MODEL)
         alternates = [config.CODE_MODEL, config.CHAT_MODEL]
-        model, warning = await resolve_model(preferred, alternates)
+        model, warning = await resolve_model(preferred, alternates, explicit=bool(request.model))
     except OllamaError as error:
         yield {"type": "error", "message": str(error)}
         return
@@ -146,6 +146,7 @@ async def _run_chat(request: ChatRequest):
         "title": db.get_conversation(conversation_id)["title"],
         "mode": mode,
         "model": model,
+        "model_fallback": bool(warning),
         "project_id": project_id,
     }
 

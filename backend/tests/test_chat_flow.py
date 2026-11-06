@@ -86,6 +86,29 @@ def test_missing_model_falls_back_with_warning(client, script):
     assert tokens(events) == "hi from coder"
 
 
+def test_atlas_never_picks_an_arbitrary_installed_model(client, script):
+    script.installed = ["some-random-model:1b", "llava:7b"]     # neither configured model, none on the list
+    events = sse(client, {"message": "hello", "conversation_id": cid(81)})
+    assert events[-1]["type"] == "error"
+    assert "not installed" in events[-1]["message"] and "some-random-model" not in tokens(events)
+    assert script.requests == []                                 # nothing was sent to any model
+
+
+def test_missing_model_lists_compatible_models_for_the_user_to_choose(client, script):
+    script.installed = ["llama3.1:8b", "nomic-embed-text:latest"]
+    events = sse(client, {"message": "hello", "conversation_id": cid(82)})
+    error = events[-1]["message"]
+    assert events[-1]["type"] == "error" and "llama3.1:8b" in error and "nomic-embed" not in error
+    assert script.requests == []
+
+
+def test_an_explicit_model_choice_is_never_replaced(client, script):
+    script.installed = ["qwen2.5-coder:7b"]
+    events = sse(client, {"message": "hello", "conversation_id": cid(83), "model": "qwen3:8b"})
+    assert events[-1]["type"] == "error" and "qwen3:8b" in events[-1]["message"]
+    assert script.requests == []
+
+
 def test_ollama_down_gives_friendly_error(client, script, monkeypatch):
     import config
     from services import ollama
@@ -108,11 +131,25 @@ def test_qwen_style_tool_call_variants(client, script):
 
 
 def test_tool_loop_is_bounded(client, script):
-    loop = json.dumps({"tool": "calculate", "arguments": {"expression": "1+1"}})
-    script.script = [loop] * 20
+    # eight different calculations are eight real tool rounds; then the model is told to answer,
+    # gets one chance to repair a tool request on that final turn, and Atlas stops with a message
+    script.script = [json.dumps({"tool": "calculate", "arguments": {"expression": f"{i}+1"}})
+                     for i in range(30)]
     events = sse(client, {"message": "x", "conversation_id": cid(9), "mode": "chat"})
     assert events[-1]["type"] == "done"
-    assert len(script.requests) == 9                 # 8 tool rounds + one forced answer
+    assert len(script.requests) == 10                # 8 tool rounds + forced answer + one repair
+    assert "kept requesting tools" in events[-1]["response"]
+    assert '"tool"' not in events[-1]["response"]    # raw tool JSON is never shown as an answer
+
+
+def test_repeating_the_same_tool_call_is_refused_and_stops_early(client, script):
+    loop = json.dumps({"tool": "calculate", "arguments": {"expression": "1+1"}})
+    script.script = [loop] * 30
+    events = sse(client, {"message": "x", "conversation_id": cid(90), "mode": "chat"})
+    tools = [e for e in events if e["type"] == "tool"]
+    assert [t["ok"] for t in tools] == [True, False, False, False]   # only the first one ran
+    assert len(script.requests) <= 8
+    assert events[-1]["type"] == "done"
 
 
 def test_huge_message_is_trimmed_with_warning(client, script):
@@ -164,7 +201,8 @@ def test_project_chat_with_tools_and_context(client, script):
     events = sse(client, {"message": "why is add wrong?", "conversation_id": cid(11), "project_id": pid, "project_name": "demo"})
     assert next(e for e in events if e["type"] == "meta")["mode"] == "code"
     labels = [e["label"] for e in events if e["type"] == "tool"]
-    assert labels == ['Searched project for "def add"', "Read app/util.py"]
+    # Atlas searches for "add" itself before the model answers; the model then looks further
+    assert labels == ['Searched project for "add"', 'Searched project for "def add"', "Read app/util.py"]
 
     first = script.requests[0]["messages"][0]["content"]
     assert pid in first and "app/main.py" in first and "return a - b" in first   # small project fully inlined

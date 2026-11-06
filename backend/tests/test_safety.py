@@ -28,13 +28,23 @@ def test_model_cannot_pick_a_project_by_writing_an_id(client, script):
 def test_an_id_pasted_in_the_message_does_not_switch_projects(client, script):
     mine = upload(client, {"a.py": "A_CONTENT = 1\n"})["project_id"]
     other = upload(client, {"b.py": "B_SECRET = 2\n"})["project_id"]
-    script.script = [tool("read_project_file", path="b.py"), "done"]
-    sse(client, {"message": f"read b.py from project {other}", "conversation_id": cid(41),
-                 "project_id": mine, "project_name": "mine"})
+    script.script = []                      # the model is never needed: b.py is not in this project
+    events = sse(client, {"message": f"read b.py from project {other}", "conversation_id": cid(41),
+                          "project_id": mine, "project_name": "mine"})
 
+    assert script.requests == []
+    assert "not found" in tokens(events)
+    assert "B_SECRET" not in json.dumps(events) and "B_SECRET" not in json.dumps(script.requests)
+
+
+def test_the_model_cannot_read_another_project_by_naming_its_id(client, script):
+    mine = upload(client, {"a.py": "A_CONTENT = 1\n"})["project_id"]
+    other = upload(client, {"b.py": "B_SECRET = 2\n"})["project_id"]
+    script.script = [tool("read_project_file", path="b.py", project_id=other), "Nothing found."]
+    sse(client, {"message": "what does the app do overall?", "conversation_id": cid(141),
+                 "project_id": mine, "project_name": "mine"})
     assert other not in script.requests[0]["messages"][0]["content"]
     assert "B_SECRET" not in json.dumps(script.requests)
-    assert "File not found" in script.requests[1]["messages"][-1]["content"]
 
 
 # ---------------------------------------------------------------- test approval
@@ -465,38 +475,20 @@ def sent(script, index=0):
     return script.requests[index]["messages"]
 
 
-def test_large_project_and_long_conversation_stay_inside_the_budget(client, script):
-    import config
-    from agent.context import DIGEST_MARKER, estimate_tokens
+def test_large_project_and_long_conversation_refuses_an_incomplete_prefetch(client, script):
     pid = make_big_project()
     seed_conversation(cid(62), pid)
     script.script = ["noted"]
 
     question = "Now explain pkg29/mod9.py in detail."
-    sse(client, {"message": question, "conversation_id": cid(62), "project_id": pid, "project_name": "big"})
-    messages = sent(script)
-    system = messages[0]["content"]
-    total = sum(estimate_tokens(m["content"]) for m in messages)
+    response = sse(client, {"message": question, "conversation_id": cid(62),
+                            "project_id": pid, "project_name": "big"})
 
-    assert total <= config.PROMPT_BUDGET_TOKENS                          # fits the model's window
-    assert messages[-1]["content"] == question                           # your message is never cut
-    assert len(system) <= config.PROMPT_BUDGET_TOKENS * config.CHARS_PER_TOKEN * (config.SYSTEM_SHARE + 0.1)
-
-    # essential evidence survived 58 later file reads and heavy history trimming
-    assert "Tests, most recent run: PASSED (12 run, 0 failures, 0 errors)" in system
-    assert "pkg9/mod9.py" in system or "pkg8/mod8.py" in system          # the newest reads are listed in detail
-    assert "this list is incomplete" in system                            # and it admits older ones may be missing
-    assert "NOT been read" not in system                                  # ... rather than falsely claiming they were not read
-
-    # a big project is summarised by its file list, not stuffed into the prompt
-    assert "PROJECT FILES (300 files" in system and "more files" in system
-    assert "=====" not in system
-    assert "def func_0_0_0" not in system
-
-    # old history was replaced by a short, labelled digest of the most recent dropped turns
-    assert DIGEST_MARKER in system and "may be incomplete or wrong" in system
-    assert "TURN-0 " not in "".join(m["content"] for m in messages)      # the very oldest is gone
-    assert "TURN-5" in system or "TURN-4" in system or any("TURN-5" in m["content"] for m in messages)
+    # The source cannot fit completely alongside the retained conversation. Atlas must
+    # refuse to analyse a partial read rather than silently send cut-off code to the model.
+    assert not script.requests
+    final_text = " ".join(str(event.get("text", event.get("response", ""))) for event in response)
+    assert "incomplete" in final_text.lower() or "cut at the size limit" in final_text.lower()
 
 
 def test_answer_length_shrinks_to_the_room_left(client, script):

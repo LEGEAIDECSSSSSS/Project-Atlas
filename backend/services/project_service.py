@@ -23,6 +23,8 @@ HEAVY_DIRS = {
     ".next", ".cache", "__macosx",
 }
 SKIP_FILES = {".ds_store", "thumbs.db"}
+HEAVY_DIRS |= set(config.EXTRA_IGNORED_DIRS)      # LC_EXTRA_IGNORED_DIRS
+HEAVY_DIRS -= set(config.INCLUDE_DIRS)            # LC_INCLUDE_DIRS
 
 TEXT_EXTENSIONS = {
     ".py", ".java", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".cs", ".cpp",
@@ -35,6 +37,15 @@ MANIFEST_NAMES = {
     "readme.md", "readme.txt", "pom.xml", "package.json", "requirements.txt",
     "pyproject.toml", "build.gradle", "cargo.toml", "go.mod", "composer.json",
 }
+
+# Extensionless names that are plain text and worth searching.
+TEXT_NAMES = {
+    "dockerfile", "makefile", "readme", "license", "changelog", "contributing", "jenkinsfile",
+    "procfile", "gemfile", "rakefile", "vagrantfile", "pipfile", ".gitignore", ".dockerignore",
+    ".editorconfig", ".env.example", ".eslintrc", ".prettierrc", ".babelrc", ".npmrc",
+}
+MAX_SEARCH_FILE_BYTES = 1_000_000
+SEARCH_TIME_BUDGET_SECONDS = 15
 
 MB = 1024 * 1024
 
@@ -94,14 +105,37 @@ def clean_relative_path(name: str):
     return path
 
 
+def _looks_binary(text: str) -> bool:
+    """Decoded bytes that are mostly control characters or replacement marks are not text."""
+    sample = text[:4000]
+    if not sample:
+        return False
+    bad = sum(1 for ch in sample if (ord(ch) < 32 and ch not in "\t\n\r\f") or ch == "\ufffd")
+    return bad / len(sample) > 0.10
+
+
 def _read_bytes_as_text(data: bytes) -> str:
     if b"\x00" in data[:8000]:
         raise ValueError("File is not a readable text file.")
     try:
-        return data.decode("utf-8-sig")
+        text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
         # Common for files saved on Windows.
-        return data.decode("cp1252", errors="replace")
+        text = data.decode("cp1252", errors="replace")
+    if _looks_binary(text):
+        raise ValueError("File is not a readable text file.")
+    return text
+
+
+def is_text_candidate(filename: str, size: int = 0) -> bool:
+    """One policy for 'worth reading as text', used by search, the index and the context map."""
+    name = filename.lower()
+    if name in SKIP_FILES:
+        return False
+    suffix = Path(name).suffix
+    if suffix:
+        return suffix in TEXT_EXTENSIONS
+    return name in TEXT_NAMES or size <= 200_000
 
 
 def read_text_file(path: Path) -> str:
@@ -413,81 +447,78 @@ def read_project_file(project_id: str, path: str):
     return read_text_file(file_path)
 
 
-def search_project(project_id: str, query: str):
-    """Search project files while skipping generated and irrelevant directories."""
+def _searchable_files(project_dir: Path):
+    """Files the search scans: the same files listing shows, minus oversized or non-text ones."""
+    for path in _walk_files(project_dir):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_SEARCH_FILE_BYTES or not is_text_candidate(path.name, size):
+            continue
+        yield path.relative_to(project_dir).as_posix(), path
+
+
+def _read_for_search(path: Path):
+    try:
+        return read_text_file(path)
+    except (ValueError, OSError):
+        return None
+
+
+def search_project(project_id: str, query: str, limit: int = 20, offset: int = 0, scan_after: str | None = None):
+    """Ranked, paginated search of a project.
+
+    Matches exact text and identifiers, split identifiers (login_user / LoginUser / "login user"),
+    file names, and, when literal hits are scarce, related code vocabulary. Every file in the
+    result carries a score and the reasons for it. The reply states how many files matched in
+    total and whether more pages exist, so a partial page is never mistaken for everything.
+    """
+    from services import search_engine
 
     project_dir = project_path(project_id)
 
-    queries = [
-        term.strip().lower()
-        for term in query.split("|")
-        if term.strip()
-    ]
-
-    if not queries:
+    if not isinstance(query, str) or not query.strip():
         raise ValueError("Search query cannot be empty.")
 
-    ignored_directories = HEAVY_DIRS | {".github", "logs"}
+    terms = search_engine.parse_query(query)
+    if not terms:
+        raise ValueError("Search query cannot be empty.")
 
-    max_file_size = 1_000_000
-    max_matches_per_file = 25
-    max_results = 50
+    try:
+        limit = max(1, min(int(limit), 50))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        raise ValueError("limit and offset must be whole numbers.")
 
-    results = []
-
-    for root, directories, filenames in os.walk(project_dir):
-        directories[:] = sorted(
-            d for d in directories if d.lower() not in ignored_directories
-        )
-
-        for filename in filenames:
-            path = Path(root) / filename
-
-            try:
-                if path.stat().st_size > max_file_size:
-                    continue
-
-                content = read_text_file(path)
-            except (ValueError, OSError):
-                continue
-
-            matching_lines = []
-
-            for line_number, line in enumerate(content.splitlines(), start=1):
-                matched_terms = [t for t in queries if t in line.lower()]
-
-                if matched_terms:
-                    matching_lines.append({
-                        "line": line_number,
-                        "content": line.strip(),
-                        "matched_terms": matched_terms,
-                    })
-
-                    if len(matching_lines) >= max_matches_per_file:
-                        break
-
-            filename_match = any(t in filename.lower() for t in queries)
-
-            if not matching_lines and not filename_match:
-                continue
-
-            results.append({
-                "path": path.relative_to(project_dir).as_posix(),
-                "matches": matching_lines,
-                "match_count": len(matching_lines),
-                "filename_match": filename_match,
-            })
-
-    results.sort(
-        key=lambda item: (item["filename_match"], item["match_count"]),
-        reverse=True,
+    wants_tests = bool(re.search(r"\b(?:tests?|spec|pytest|junit)\b", query, re.IGNORECASE))
+    found = search_engine.run_search(
+        sorted(_searchable_files(project_dir), key=lambda item: item[0]), terms, limit, offset,
+        SEARCH_TIME_BUDGET_SECONDS, wants_tests, _read_for_search, scan_after,
     )
+
+    page = found["page"]
+    total = found["total_files"]
+    has_more = found["scan_truncated"] or offset + len(page) < total
 
     return {
         "project_id": project_id,
         "query": query,
-        "total_matches": len(results),
-        "results": results[:max_results],
+        "terms": [{"term": t.raw, "words": t.words} for t in terms],
+        "synonyms_used": found["synonyms_used"],
+        "total_files": total,
+        "total_matches": total,           # kept for older callers
+        "returned_files": len(page),
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": offset + len(page) if has_more else None,
+        "scanned_files": found["scanned_files"],
+        "scan_truncated": found["scan_truncated"],
+        "scan_after": scan_after,
+        "scan_cursor": found.get("scan_cursor"),
+        "next_scan_after": found.get("scan_cursor") if found["scan_truncated"] else None,
+        "results": page,
     }
 
 
@@ -500,7 +531,13 @@ def _size_label(size):
 
 
 def build_project_context(project_id: str, char_budget: int) -> str:
-    """A compact file listing, plus the file contents themselves when the project is small."""
+    """What the model is told about an attached project.
+
+    A small project is shown in full. A larger one is shown as a compact PROJECT MAP (purpose,
+    languages, frameworks, entry points, routes, folders and key modules, built from the code
+    index) plus a short capped file list, never a dump of thousands of names. Everything else
+    is fetched on demand with the project tools.
+    """
     project_dir = project_path(project_id)
 
     entries = []
@@ -515,7 +552,7 @@ def build_project_context(project_id: str, char_budget: int) -> str:
     if not entries:
         return "The project is empty."
 
-    listing_budget = int(char_budget * 0.35)
+    listing_budget = int(char_budget * 0.30)
     lines, used = [], 0
 
     for path, size in entries:
@@ -545,15 +582,28 @@ def build_project_context(project_id: str, char_budget: int) -> str:
         parts.append("The complete contents of every text file are shown below.")
         for path, content in text_files:
             parts += [f"===== {path.relative_to(project_dir).as_posix()} =====", content, ""]
-    else:
-        parts.append(
-            "Only key files are shown. Use search_project and read_project_file "
-            "to inspect anything else before making claims about it."
-        )
+        return "\n".join(parts)
+
+    project_map = ""
+    try:
+        from services import code_index
+        project_map = code_index.project_map_text(project_id, max(600, int(remaining * 0.7)))
+    except Exception:                                # a broken index must never hide the project
+        project_map = ""
+
+    if project_map:
+        parts += [project_map, ""]
+        remaining -= len(project_map)
+
+    parts.append(
+        "Only a map and a short file list are shown. Use search_project, find_symbol, "
+        "read_symbol and read_project_file to inspect anything before making claims about it."
+    )
+    if not project_map:
         for path, content in text_files:
             if path.name.lower() in MANIFEST_NAMES and remaining > 600:
                 snippet = content[:1500]
-                parts += [f"===== {path.relative_to(project_dir).as_posix()} =====", snippet, ""]
+                parts += [f"--- {path.relative_to(project_dir).as_posix()} (start) ---", snippet, ""]
                 remaining -= len(snippet)
 
     return "\n".join(parts)

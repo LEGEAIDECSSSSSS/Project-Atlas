@@ -1,6 +1,8 @@
 import asyncio
+import threading
 from typing import List
 
+import config
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -21,6 +23,21 @@ from services.project_service import (
 router = APIRouter()
 
 
+def _warm_index(project_id: str) -> None:
+    """Build the code index in the background so the first question about a big project is fast."""
+    if not config.WARM_INDEX_ON_UPLOAD:
+        return
+
+    def work():
+        try:
+            from services import code_index
+            code_index.get_index(project_id)
+        except Exception:
+            pass        # the index is rebuilt on demand; warming is only an optimisation
+
+    threading.Thread(target=work, name="index-warmup", daemon=True).start()
+
+
 def _safe_filename(name: str, default: str) -> str:
     cleaned = "".join(c for c in (name or "") if c.isalnum() or c in "-_. ").strip()
     return cleaned or default
@@ -30,6 +47,7 @@ def _safe_filename(name: str, default: str) -> str:
 async def upload_project(file: UploadFile = File(...)):
     try:
         stats = await asyncio.to_thread(extract_project_with_stats, file)
+        _warm_index(stats["project_id"])
 
         return {
             "message": "Project uploaded successfully.",
@@ -64,6 +82,8 @@ async def upload_files(
             [(f.filename, f.file) for f in files],
             project_id or None,
         )
+        if stats.get("project_id"):
+            _warm_index(stats["project_id"])
         return {**stats, "name": files[0].filename if len(files) == 1 else f"{len(files)} files"}
 
     except ProjectBusy as error:
@@ -127,9 +147,10 @@ async def get_project_file(project_id: str, path: str):
 
 
 @router.get("/projects/{project_id}/search")
-async def search_project_files(project_id: str, query: str):
+async def search_project_files(project_id: str, query: str, limit: int = 20, offset: int = 0, scan_after: str | None = None):
     try:
-        return search_project(project_id, query)
+        # a scan can take a second or more on a big project: keep it off the event loop
+        return await asyncio.to_thread(search_project, project_id, query, limit, offset, scan_after)
 
     except FileNotFoundError as error:
         raise HTTPException(

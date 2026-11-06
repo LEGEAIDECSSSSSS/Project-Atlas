@@ -76,6 +76,33 @@ logo is a placeholder), `<title>` in `frontend/index.html`. Backend: `LC_APP_NAM
 - A 7B model is a 7B model: it is decent for everyday tasks and focused code fixes, but it will not
   match a large cloud model on big refactors. Keep requests focused.
   edits via search/replace patches would be a good next step for large files.
-- `run_project_tests` still supports Maven only. Adding `pytest` / `npm test` is straightforward.
+- `run_project_tests` supports Python (pytest/unittest), Node (npm/pnpm/yarn), Maven, Gradle, Go and Rust.
+  Node tests need an installed `node_modules` (uploads never include one and Atlas never runs `npm install`).
 - No web access, no image input. A very large pasted file is cut to fit the context (you get a warning);
   upload it as a ZIP or file instead so the assistant can read it in pieces.
+
+## How Atlas investigates a project
+
+Atlas does not rely on the model deciding to look at your code.
+
+- **Named files and file listings** ("show the first 20 lines of `a.py`", "list the files") are read by Atlas itself.
+  Plain "show me" requests are answered straight from the file, with no model call.
+- **Broad questions** ("how does login work?", "what happens at startup?") get an automatic investigation first:
+  ranked searches (identifier-aware, with filename and code-vocabulary matching), definition lookups,
+  route traces (`route -> handler -> services -> data`), and complete function/class excerpts that share the
+  prompt budget. The model then answers from that evidence.
+- **Tools the model can use**: `search_project` (paged), `read_project_file`, `list_project_files`, `find_symbol`,
+  `read_symbol`, `find_references`, `find_callers`, `find_callees`, `find_imports`, `trace_route`,
+  `find_tests_for_symbol`, `find_entry_points`, `run_project_tests`. Python is parsed with the real parser;
+  JavaScript/TypeScript and Java use careful scanners. Calls are matched by name (no type inference), and the tools
+  say when a name is ambiguous.
+- **Every project answer is checked** before it is shown: named files, functions, `path:line` citations, call
+  claims and test claims are compared with the project index and with what was really read. Problems are listed
+  under "Check this reply before trusting it"; strict "evidence table" requests are withheld if they fail.
+
+Settings (environment variables): `LC_MODEL_ALLOWLIST` (models offered when yours is missing; Atlas never
+switches to an arbitrary model), `LC_EXTRA_IGNORED_DIRS` / `LC_INCLUDE_DIRS` (folders to leave out or to keep),
+`LC_WARM_INDEX=0` (do not build the code index right after an upload), and `LC_DEBUG_AGENT=1` for metadata-only logs (`LC_DEBUG_AGENT_VERBOSE=1` also prints prompts; both are off by default).
+
+Limits worth knowing: no semantic/embedding search, no type-aware call graph, and the JS/Java parsers are
+scanners rather than full grammars. Dynamic calls (reflection, string-based dispatch) are invisible to the graph tools.

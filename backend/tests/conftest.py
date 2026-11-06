@@ -26,6 +26,7 @@ os.environ["LC_DATA_DIR"] = _tmp
 os.environ["LC_OLLAMA_URL"] = f"http://127.0.0.1:{_port}"
 os.environ["LC_CODE_MODEL"] = "qwen2.5-coder:7b"
 os.environ["LC_CHAT_MODEL"] = "qwen2.5:7b"
+os.environ["LC_WARM_INDEX"] = "0"
 
 
 class FakeOllama:
@@ -122,3 +123,101 @@ def sse(client, body):
             if line.startswith("data:"):
                 events.append(json.loads(line[5:].strip()))
     return events
+
+
+@pytest.fixture
+def project():
+    """Create real project folders in the test workspace; removed again afterwards."""
+    from tests.test_agent_gate import World
+    made = []
+
+    def make(files):
+        world = World(files)
+        made.append(world)
+        return world
+
+    yield make
+    for world in made:
+        world.close()
+
+
+SAMPLE_PROJECT = {
+    "README.md": "# Shop\n\nA small web shop with a FastAPI backend and a React storefront.\n",
+    "package.json": '{"name": "shop", "scripts": {"start": "vite", "test": "vitest run"}, "dependencies": {"react": "18"}}',
+    "requirements.txt": "fastapi\nuvicorn\npytest\n",
+    "backend/main.py": (
+        "from fastapi import FastAPI\n"
+        "from backend.api import auth\n\n"
+        "app = FastAPI()\n"
+        "app.include_router(auth.router)\n\n\n"
+        "def main():\n"
+        "    import uvicorn\n"
+        "    uvicorn.run(app)\n\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    ),
+    "backend/api/__init__.py": "",
+    "backend/api/auth.py": (
+        "from fastapi import APIRouter\n"
+        "from backend.services.auth_service import authenticate_user\n\n"
+        "router = APIRouter()\n\n\n"
+        "@router.post(\"/login\")\n"
+        "def login(body):\n"
+        "    \"\"\"Log a user in.\"\"\"\n"
+        "    user = authenticate_user(body.email, body.password)\n"
+        "    return {\"token\": user.token}\n\n\n"
+        "@router.get(\"/health\")\n"
+        "def health():\n"
+        "    return {\"ok\": True}\n"
+    ),
+    "backend/services/__init__.py": "",
+    "backend/services/auth_service.py": (
+        "from backend.services.user_repo import find_user, verify_password\n\n\n"
+        "def authenticate_user(email, password):\n"
+        "    # look the user up, then check the password\n"
+        "    user = find_user(email)\n"
+        "    if not verify_password(user, password):\n"
+        "        raise PermissionError(\"bad credentials\")\n"
+        "    return user\n"
+    ),
+    "backend/services/user_repo.py": (
+        "USERS = {}\n\n\n"
+        "def find_user(email):\n"
+        "    return USERS[email]\n\n\n"
+        "def verify_password(user, password):\n"
+        "    return user.password == password\n"
+    ),
+    "backend/tests/test_auth.py": (
+        "from backend.services.auth_service import authenticate_user\n\n\n"
+        "def test_login_ok():\n"
+        "    assert authenticate_user('a@b.c', 'pw')\n"
+    ),
+    "frontend/src/api.js": (
+        "const API = 'http://localhost:8000';\n"
+        "export async function login(email, password) {\n"
+        "  const r = await fetch(`${API}/login`, { method: 'POST', body: JSON.stringify({ email, password }) });\n"
+        "  return r.json();\n"
+        "}\n"
+    ),
+    "frontend/src/App.jsx": (
+        "import React from 'react';\n"
+        "import { login } from './api';\n\n"
+        "export function LoginForm() {\n"
+        "  const submit = async () => { await login('a', 'b'); };\n"
+        "  return <button onClick={submit}>Sign in</button>;\n"
+        "}\n"
+    ),
+    "src/main/java/com/shop/UserController.java": (
+        "package com.shop;\n\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api\")\n"
+        "public class UserController {\n"
+        "    private final UserService service;\n\n"
+        "    @GetMapping(\"/users/{id}\")\n"
+        "    public User getUser(@PathVariable Long id) {\n"
+        "        return service.findById(id);\n"
+        "    }\n"
+        "}\n"
+    ),
+}

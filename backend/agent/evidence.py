@@ -8,6 +8,7 @@ against them.
 import re
 
 import config
+from services import code_parsers
 
 MAX_RECORDS = 40
 
@@ -28,8 +29,23 @@ CONST_FUNCTION = re.compile(
 NOT_NAMES = {"if", "for", "while", "switch", "catch", "return", "new", "else"}
 
 
-def outline(text, limit=14):
-    """Names of the classes/functions/methods defined in a piece of source, in order."""
+def outline(text, limit=14, path=None):
+    """Names of the classes/functions/methods defined in a piece of source, in order.
+
+    Uses the real parser for languages it supports (so nothing is missed or invented); falls
+    back to patterns for partial or unparseable text.
+    """
+    if path:
+        try:
+            parsed = code_parsers.parse_source(path, text or "")
+            names = []
+            for symbol in sorted(parsed.symbols, key=lambda s: s.start):
+                if symbol.name not in names and symbol.name not in NOT_NAMES:
+                    names.append(symbol.name)
+            if names and not parsed.parser.startswith(("generic", "failed", "skipped", "none")):
+                return names[:limit]
+        except Exception:
+            pass
     found = []
     for pattern in (DEFINITION, JAVA_METHOD, CONST_FUNCTION):
         for match in pattern.finditer(text or ""):
@@ -55,63 +71,125 @@ def test_status(result):
         return "timed_out"
     if status == "failed":
         return "failed"
+    if status == "unverified":
+        return "unverified"
     if status == "passed":
-        summary = result.get("summary") or {}
+        summary = result.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
         if summary and summary.get("tests_run") == 0:
             return "no_tests"
+        if not summary:
+            # A zero exit code with no test counts proves nothing was actually checked.
+            return "unverified"
         return "passed"
     return "error"
 
 
+GRAPH_TOOLS = {
+    "find_symbol": ("symbols", "name"),
+    "find_references": ("references", "name"),
+    "find_callers": ("callers", "name"),
+    "find_callees": ("callees", "name"),
+    "find_imports": ("imports", "path"),
+    "trace_route": ("routes", "query"),
+    "find_tests_for_symbol": ("test_files", "name"),
+    "find_entry_points": ("entry_points", None),
+}
+
+
+def _read_record(tool_name, path, lines, total, complete, content, symbol=None):
+    record = {
+        "tool": "read_project_file",
+        "path": path,
+        "lines": lines,
+        "of": total,
+        "complete": complete,
+        "outline": outline(content, path=path),
+        # Keep a bounded copy so strict evidence checks can validate source excerpts.
+        "source_text": content[:12000],
+    }
+    if symbol:
+        record["symbol"] = symbol
+    return record
+
+
 def records_from_tool(tool_name, arguments, result):
     """Evidence records for one finished tool call (a list, possibly empty)."""
+    arguments = arguments if isinstance(arguments, dict) else {}
+
     if tool_name == "calculate":
         return []
 
     if tool_name == "run_project_tests":
         record = {"tool": tool_name, "status": test_status(result)}
-        if isinstance(result, dict) and result.get("summary"):
+        if isinstance(result, dict) and isinstance(result.get("summary"), dict):
             record["summary"] = result["summary"]
+        if isinstance(result, dict) and result.get("ecosystem"):
+            record["ecosystem"] = result["ecosystem"]
         return [record]
 
     if not isinstance(result, dict) or result.get("error"):
         return []
 
     if tool_name == "read_project_file":
-        return [{
-            "tool": tool_name,
-            "path": result.get("path"),
-            "lines": f"{result.get('start_line')}-{result.get('end_line')}",
-            "of": result.get("total_lines"),
-            "complete": not result.get("truncated"),
-            "outline": outline(result.get("content", "")),
-            # Keep a bounded copy so strict evidence checks can validate source excerpts.
-            "source_text": result.get("content", "")[:12000],
-        }]
+        content = result.get("content") if isinstance(result.get("content"), str) else ""
+        return [_read_record(
+            tool_name, result.get("path"), f"{result.get('start_line')}-{result.get('end_line')}",
+            result.get("total_lines"), not result.get("truncated"), content)]
+
+    if tool_name == "read_symbol":
+        content = result.get("content") if isinstance(result.get("content"), str) else ""
+        record = _read_record(
+            tool_name, result.get("path"), f"{result.get('start_line')}-{result.get('end_line')}",
+            result.get("total_lines"), not result.get("truncated"), content,
+            symbol=result.get("qualname"))
+        if result.get("qualname") and result["qualname"] not in record["outline"]:
+            record["outline"] = [result["qualname"].split(".")[-1]] + record["outline"]
+        return [record]
 
     if tool_name == "search_project":
+        results = result.get("results")
+        results = results if isinstance(results, list) else []
         records = [{
             "tool": tool_name,
-            "query": arguments.get("query", ""),
-            "files": [r["path"] for r in result.get("results", [])[:6]],
+            "query": str(arguments.get("query", "")),
+            "files": [r["path"] for r in results[:6]
+                      if isinstance(r, dict) and isinstance(r.get("path"), str)],
+            "total": result.get("total_files", result.get("total_matches")),
         }]
-        auto = result.get("automatically_read_file")
-        if auto:
-            content = auto.get("content", "")
-            records.append({
-                "tool": "read_project_file",
-                "path": auto["path"],
-                "lines": f"1-{content.count(chr(10)) + 1}",
-                "of": None,
-                "complete": "[File content truncated" not in content,
-                "outline": outline(content),
-                # This content came from the actual automatically-read source file.
-                "source_text": content[:12000],
-            })
+        autos = result.get("automatically_read_files")
+        if not isinstance(autos, list):
+            single = result.get("automatically_read_file")
+            autos = [single] if isinstance(single, dict) else []
+        for auto in autos:
+            if not isinstance(auto, dict) or not isinstance(auto.get("path"), str):
+                continue
+            content = auto.get("content") if isinstance(auto.get("content"), str) else ""
+            start = auto.get("start_line") or 1
+            end = auto.get("end_line") or (start + content.count(chr(10)))
+            records.append(_read_record(
+                "read_project_file", auto["path"], f"{start}-{end}",
+                auto.get("total_lines"),
+                auto.get("complete", "[File content truncated" not in content), content))
         return records
 
     if tool_name == "list_project_files":
         return [{"tool": tool_name, "total": result.get("total")}]
+
+    if tool_name in GRAPH_TOOLS:
+        key, arg = GRAPH_TOOLS[tool_name]
+        items = result.get(key)
+        items = items if isinstance(items, list) else []
+        files = []
+        for item in items[:8]:
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"] not in files:
+                files.append(item["path"])
+        return [{
+            "tool": tool_name,
+            "query": str(arguments.get(arg, "")) if arg else "",
+            "total": result.get("total", len(items)),
+            "files": files[:6],
+        }]
 
     return []
 
@@ -121,6 +199,8 @@ def merge(record_lists):
     merged, seen = [], set()
     for records in record_lists:
         for record in records or []:
+            if not isinstance(record, dict):
+                continue
             key = (record.get("tool"), record.get("path"), record.get("lines"), record.get("query"))
             if record.get("tool") == "run_project_tests":
                 key = ("tests", len(merged))      # every test run is its own event
@@ -138,12 +218,13 @@ def merge(record_lists):
 
 
 def files_read(records):
-    return {r["path"] for r in records if r.get("tool") == "read_project_file" and r.get("path")}
+    return {r["path"] for r in records or []
+            if isinstance(r, dict) and r.get("tool") in ("read_project_file", "read_symbol") and r.get("path")}
 
 
 def last_test_status(records):
-    for record in reversed(records):
-        if record.get("tool") == "run_project_tests":
+    for record in reversed(records or []):
+        if isinstance(record, dict) and record.get("tool") == "run_project_tests":
             return record.get("status", "error"), record.get("summary")
     return "never_run", None
 
@@ -155,6 +236,7 @@ TEST_WORDS = {
     "error": "COULD NOT RUN (tool error)",
     "not_run": "NOT RUN (the user has not approved running tests)",
     "no_tests": "BUILD PASSED BUT ZERO TESTS RAN (this proves nothing)",
+    "unverified": "EXITED SUCCESSFULLY BUT NO TEST COUNT WAS FOUND (this proves nothing)",
     "never_run": "NEVER RUN in this conversation",
 }
 
@@ -177,8 +259,8 @@ def render_block(records, max_chars=None):
     status, summary = last_test_status(records)
     detail = ""
     if summary:
-        detail = (f" ({summary['tests_run']} run, {summary['failures']} failures, "
-                  f"{summary['errors']} errors)")
+        detail = (f" ({summary.get('tests_run', '?')} run, {summary.get('failures', '?')} failures, "
+                  f"{summary.get('errors', '?')} errors)")
     footer = [
         f"Tests, most recent run: {TEST_WORDS.get(status, status)}{detail}",
         "Earlier file contents are not repeated. Re-read a file before quoting it or describing it.",
@@ -189,9 +271,10 @@ def render_block(records, max_chars=None):
         if record.get("tool") == "read_project_file" and record.get("path"):
             reads = [r for r in reads if r["path"] != record["path"]] + [record]
     searches = [r for r in records if r.get("tool") == "search_project"][-3:]
+    lookups = [r for r in records if r.get("tool") in GRAPH_TOOLS][-4:]
 
     def full_line(r):
-        part = f"lines {r['lines']}" + (f" of {r['of']}" if r.get("of") else "")
+        part = f"lines {r.get('lines', '?')}" + (f" of {r['of']}" if r.get("of") else "")
         defs = f"; defines {', '.join(r['outline'][:8])}" if r.get("outline") else ""
         return f"- {r['path']} ({part}{defs})"
 
@@ -211,8 +294,10 @@ def render_block(records, max_chars=None):
         else:
             body.append("Files you have opened: none. You have not read any file yet.")
         for r in searches:
-            where = ", ".join(r["files"][:4]) if r["files"] else "no matches"
-            body.append(f'- searched "{r["query"][:40]}": {where}')
+            where = ", ".join(r.get("files", [])[:4]) if r.get("files") else "no matches"
+            body.append(f'- searched "{str(r.get("query", ""))[:40]}": {where}')
+        for r in lookups:
+            body.append(f'- {r["tool"]} {str(r.get("query", ""))[:40]}: {r.get("total", 0)} result(s)')
         return "\n".join(header + body + footer)
 
     keep_detailed = min(len(reads), 8)

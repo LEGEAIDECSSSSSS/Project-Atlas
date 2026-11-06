@@ -31,6 +31,15 @@ CURRENCY = os.getenv("LC_CURRENCY", "")
 OLLAMA_URL = os.getenv("LC_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 CODE_MODEL = os.getenv("LC_CODE_MODEL", "qwen2.5-coder:7b")
 CHAT_MODEL = os.getenv("LC_CHAT_MODEL", "qwen2.5:7b")
+# Models Atlas may suggest when the configured one is not installed. Atlas never silently
+# switches to a model outside the configured pair; it lists these as options instead.
+MODEL_ALLOWLIST = tuple(
+    m.strip().lower() for m in os.getenv(
+        "LC_MODEL_ALLOWLIST",
+        "qwen2.5-coder,qwen2.5,qwen3,deepseek-coder,codellama,codestral,llama3,starcoder2,"
+        "gemma2,gemma3,mistral,phi3,phi4",
+    ).split(",") if m.strip()
+)
 
 # Context window. 8192 tokens of a 7B Q4 model costs ~0.5 GB of VRAM, which is
 # about what a 6 GB GTX 1660 Ti can spare. Drop to 4096 if `ollama ps` shows
@@ -84,3 +93,19 @@ TEST_TIMEOUT_SECONDS = _int("LC_TEST_TIMEOUT", 120)
 TEST_OUTPUT_CHARS = _int("LC_TEST_OUTPUT_CHARS", 12000)
 # How long a request waits for another operation on the same project before giving up.
 LOCK_TIMEOUT_SECONDS = _float("LC_LOCK_TIMEOUT", 5)
+
+# Build the code index in the background right after an upload (set LC_WARM_INDEX=0 to disable).
+WARM_INDEX_ON_UPLOAD = os.getenv("LC_WARM_INDEX", "1") != "0"
+
+# Folders left out of listing, search, the code index and uploads (in addition to the built-in
+# list: node_modules, .git, build output ...). Comma separated, folder names only.
+EXTRA_IGNORED_DIRS = tuple(
+    d.strip().lower() for d in os.getenv("LC_EXTRA_IGNORED_DIRS", "").split(",") if d.strip())
+# Built-in ignored folders to include again (for example "build" or "dist" in a project that
+# keeps real source there).
+INCLUDE_DIRS = tuple(
+    d.strip().lower() for d in os.getenv("LC_INCLUDE_DIRS", "").split(",") if d.strip())
+
+# Agent debug logging: metadata only. VERBOSE also prints prompts, model output and tool arguments.
+DEBUG_AGENT = os.getenv("LC_DEBUG_AGENT", "0") == "1"
+DEBUG_AGENT_VERBOSE = os.getenv("LC_DEBUG_AGENT_VERBOSE", "0") == "1"
