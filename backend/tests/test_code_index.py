@@ -221,3 +221,103 @@ def test_unparseable_and_huge_files_do_not_break_the_index(project, monkeypatch)
     index = ci.get_index(w.project_id)
     assert index.skipped_large == 1 and index.unparsed == 1
     assert "Not indexed" in ci.project_map_text(w.project_id, 2000)
+
+
+def test_js_api_object_methods_are_indexed_without_becoming_server_routes():
+    parsed = cp.parse_source("api.js", """const BASE = '/api'
+async function request(method, path, body) { return fetch(BASE + path) }
+export const api = {
+  post: (path, body) => request('POST', path, body),
+}
+""")
+    assert parsed.routes == []
+    assert parsed.api_calls == []  # dynamic fetch(BASE + path) is not a literal URL
+    method = next(symbol for symbol in parsed.symbols if symbol.qualname == "api.post")
+    assert (method.start, method.end) == (4, 4)
+    assert any(call.callee == "request" and call.caller == "api.post" for call in parsed.calls)
+
+    # A data variable as the second argument must not make an API client look like a server route.
+    client_call = cp.parse_source("client.js", """const api = { post: (path, body) => request('POST', path, body) }
+api.post('/auth/login', credentials)
+""")
+    assert client_call.routes == []
+
+
+def test_js_function_block_end_ignores_destructured_parameters():
+    parsed = cp.parse_source("provider.jsx", """export function AuthProvider({ children }) {
+  const value = { children }
+  return value
+}
+
+export const useAuth = () => useContext(AuthContext)
+""")
+    provider = next(symbol for symbol in parsed.symbols if symbol.name == "AuthProvider")
+    assert (provider.start, provider.end) == (1, 4)
+
+
+def test_javascript_indexes_named_callbacks_inside_generic_wrappers():
+    from services import code_parsers as cp
+
+    source = '''const login = memoize(\n  async (email, password) => {\n    return authenticate(email, password)\n  },\n)\n'''
+    parsed = cp.parse_source("client/auth.ts", source)
+    login = [symbol for symbol in parsed.symbols if symbol.name == "login"]
+    assert len(login) == 1
+    assert (login[0].start, login[0].end, login[0].kind) == (1, 4, "function")
+
+
+def test_javascript_indexes_qualified_callback_wrappers():
+    from services import code_parsers as cp
+
+    source = '''export const save = helpers.memoize(\n  async (item) => {\n    return persist(item)\n  },\n)\n'''
+    parsed = cp.parse_source("client/actions.ts", source)
+    save = [symbol for symbol in parsed.symbols if symbol.name == "save"]
+    assert len(save) == 1
+    assert (save[0].start, save[0].end) == (1, 4)
+
+
+def test_wrapped_callback_detection_does_not_capture_a_later_declaration():
+    from services import code_parsers as cp
+
+    source = '''const result = fetchValue(\n  input,\n)\n\nconst save = wrap(\n  async (item) => {\n    return persist(item)\n  },\n)\n'''
+    parsed = cp.parse_source("client/actions.js", source)
+    names = {symbol.name for symbol in parsed.symbols}
+    assert "save" in names
+    assert "result" not in names
+
+
+def test_javascript_expression_arrow_does_not_swallow_following_component():
+    from services import code_parsers as cp
+
+    source = '''const forgetEverythingElse = (queryClient) =>
+  queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== 'me' })
+
+export function AuthProvider({ children }) {
+  const value = useMemo(() => ({ children }), [children])
+  return value
+}
+'''
+    parsed = cp.parse_source("client/auth.jsx", source)
+    symbols = {symbol.name: symbol for symbol in parsed.symbols}
+    assert (symbols["forgetEverythingElse"].start, symbols["forgetEverythingElse"].end) == (1, 2)
+    assert (symbols["AuthProvider"].start, symbols["AuthProvider"].end) == (4, 7)
+    # `value` is the result of useMemo, not a named function definition.
+    assert "value" not in symbols
+
+
+def test_javascript_wrapped_async_callbacks_end_at_their_own_body():
+    from services import code_parsers as cp
+
+    source = '''const login = useCallback(
+  async (email, password) => {
+    return authenticate(email, password)
+  },
+  [queryClient],
+)
+const logout = useCallback(async () => {
+  await signOut()
+}, [queryClient])
+'''
+    parsed = cp.parse_source("client/auth.jsx", source)
+    symbols = {symbol.name: symbol for symbol in parsed.symbols}
+    assert (symbols["login"].start, symbols["login"].end) == (1, 4)
+    assert (symbols["logout"].start, symbols["logout"].end) == (7, 9)

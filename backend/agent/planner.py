@@ -25,6 +25,7 @@ class Plan:
     queries: list = field(default_factory=list)       # search_project queries, best first
     symbols: list = field(default_factory=list)       # identifiers named in the question
     route_queries: list = field(default_factory=list)
+    flow_candidates: list = field(default_factory=list)   # feature terms to try as a route query
     entry_points: bool = False
     callers_of: list = field(default_factory=list)
     tests_for: list = field(default_factory=list)
@@ -58,6 +59,24 @@ def _is_conceptual_word(word):
 
 MAX_PLANNED_CHARS = 4000
 
+# Questions shaped like "explain a process end to end". The shape, not any feature word, is what
+# marks them, so this works for login, checkout, uploads or anything else.
+PROCESS_QUESTION = re.compile(
+    r"\b(?:what\s+happens|walk\s+(?:me\s+)?through|step[- ]by[- ]step|end[- ]to[- ]end|"
+    r"how\s+(?:does|do|is|are|did)\b[^?.!]{0,80}?\b(?:work|works|start|starts|begin|begins|reach|reaches|"
+    r"handled|processed|flow|flows|connect|connects|get|gets|go|goes)\b|"
+    r"(?:complete|entire|whole|full)\s+\w+(?:\s+\w+)?\s+(?:process|flow|lifecycle|journey|workflow)|"
+    r"(?:process|flow|lifecycle|workflow)\s+of\b|functions?\s+(?:involved|that\s+(?:handle|implement))|"
+    r"from\s+the\s+\w+(?:\s+\w+){0,3}\s+(?:to|through|until)\s+the\b)",
+    re.IGNORECASE,
+)
+FLOW_NOISE = {"complete", "process", "processes", "starting", "following", "frontend", "backend", "page",
+              "request", "response", "function", "functions", "files", "file", "sequence", "calls", "call",
+              "responsibility", "actual", "project", "relevant", "involved", "entire", "walk", "through",
+              "happens", "happen", "work", "works", "user", "users", "creates", "create", "whole", "full",
+              "step", "steps", "start", "starts", "reach", "reaches", "connect", "connects", "form",
+              "database", "code", "application", "app", "system", "explain", "find"}
+
 
 def make_plan(message):
     text = (message or "")[:MAX_PLANNED_CHARS]
@@ -76,6 +95,9 @@ def make_plan(message):
         if lowered_words & intent_words:
             plan.intents.add(intent)
 
+    if PROCESS_QUESTION.search(text):
+        plan.intents.add("flow")
+
     plan.entry_points = "startup" in plan.intents
     plan.wants_tests = "tests" in plan.intents
 
@@ -86,9 +108,15 @@ def make_plan(message):
     topical = [w for w in plan.words if w not in signal_words] or plan.words
 
     route_paths = [m.group(1) for m in _PATH_TOKEN_RE.finditer(text) if len(m.group(1)) > 1]
-    if "route" in plan.intents or route_paths:
-        plan.route_queries = route_paths[:2] or [" ".join(topical[:3])] if (route_paths or topical) else []
-        plan.route_queries = [q for q in plan.route_queries if q]
+    if route_paths:
+        plan.route_queries = route_paths[:2]
+    elif "flow" in plan.intents:
+        # Prefer the feature term over generic flow wording such as complete/process/frontend.
+        flow_terms = [word for word in topical if word not in FLOW_NOISE]
+        plan.route_queries = flow_terms[:1]
+        plan.flow_candidates = flow_terms[:4]
+    elif "route" in plan.intents and topical:
+        plan.route_queries = [" ".join(topical[:3])]
 
     if "callers" in plan.intents and plan.symbols:
         plan.callers_of = plan.symbols[:1]

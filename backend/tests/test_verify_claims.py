@@ -152,3 +152,66 @@ def test_read_symbol_counts_as_a_real_source_read():
                "source_text": "def login():\n    return True"}]
     assert V.check_answer("The `login` function exists.", FILES,
                            "Inspect the login function in agent.py", source) == []
+
+
+def test_structured_function_line_ranges_must_match_index_and_read_source():
+    evidence = [{
+        "tool": "read_project_file", "path": "app/auth.py", "lines": "10-20", "of": 40,
+        "complete": True, "source_text": "\n" * 9 + "def login():\n    return True\n" + "\n" * 9,
+    }]
+    facts = {
+        "symbols": {"login"}, "files": {"app/auth.py"}, "call_edges": set(),
+        "line_counts": {"app/auth.py": 40},
+        "symbol_locations": {"login": [{"path": "app/auth.py", "start_line": 10, "end_line": 11}]},
+    }
+    prompt = "Trace the complete login process. Include file paths and line numbers."
+    good = "**Function:** `login`\n**File Path:** `app/auth.py`\n**Line Numbers:** 10-11"
+    bad_function_range = "**Function:** `login`\n**File Path:** `app/auth.py`\n**Line Numbers:** 12-13"
+    unread_range = "**Function:** `login`\n**File Path:** `app/auth.py`\n**Line Numbers:** 30-31"
+    assert V.check_answer(good, FILES + ["app/auth.py"], prompt, evidence, facts) == []
+    assert any("different line range" in note for note in
+               V.check_answer(bad_function_range, FILES + ["app/auth.py"], prompt, evidence, facts))
+    assert any("not included in the source" in note for note in
+               V.check_answer(unread_range, FILES + ["app/auth.py"], prompt, evidence, facts))
+
+
+def test_bolded_invented_symbol_names_are_checked():
+    evidence = [{"tool": "read_project_file", "path": "a.py", "lines": "1-2", "of": 2,
+                 "source_text": "def real_helper():\n    pass\n"}]
+    out = V.check_answer("It calls **_invented_helper**.", ["a.py"], "explain", evidence, facts=None)
+    assert out and "_invented_helper" in out[0]
+
+
+def test_each_function_label_requires_its_own_path_and_line_numbers():
+    answer = (
+        "**Function:** `login`\n**File Path:** `app/auth.py`\n**Line Numbers:** 10-11\n\n"
+        "**Function:** `verify_password`\nNo source location was provided."
+    )
+    out = V.check_answer(
+        answer, FILES + ["app/auth.py"],
+        "Trace the complete process. For every function, provide its file path and line numbers.",
+        [{"tool": "read_project_file", "path": "app/auth.py", "lines": "10-20", "of": 20,
+          "complete": True}],
+        {"symbols": {"login", "verify_password"}, "files": set(FILES + ["app/auth.py"]),
+         "call_edges": set(), "line_counts": {"app/auth.py": 20},
+         "symbol_locations": {"login": [{"path": "app/auth.py", "start_line": 10, "end_line": 11}]}}
+    )
+    assert any("without both its project file path and line numbers" in note for note in out)
+
+
+def test_unresolved_imported_api_is_not_misreported_as_a_project_definition():
+    evidence = [{
+        "tool": "read_project_file", "path": "frontend/auth.jsx", "lines": "1-12",
+        "of": 12, "complete": True,
+        "source_text": "import { useCallback } from 'react'\nconst login = useCallback(() => true, [])\n",
+    }]
+    facts = {
+        "symbols": {"login"}, "files": {"frontend/auth.jsx"}, "call_edges": set(),
+        "line_counts": {"frontend/auth.jsx": 12},
+        "symbol_locations": {"login": [{"path": "frontend/auth.jsx", "start_line": 2, "end_line": 2}]},
+    }
+    answer = (
+        "**Function:** `useCallback`\n**File Path:** `frontend/auth.jsx`\n**Line Numbers:** 1-2"
+    )
+    notes = V.check_answer(answer, ["frontend/auth.jsx"], "Explain the source", evidence, facts)
+    assert any("not an indexed project definition" in note for note in notes)

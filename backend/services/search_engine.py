@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 
 from services import vocab
+from services.textlines import source_lines
 
 MAX_MATCHES_STORED = 25          # lines remembered per file while scanning
 MAX_MATCHES_SHOWN = 12           # lines returned per file
@@ -161,7 +162,7 @@ def scan_file(rel_path, text, terms, rx_literal, rx_all):
 
     results = {i: [] for i in range(len(terms))}
     in_docstring = False
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(source_lines(text), start=1):
         stripped = line.strip()
         was_docstring = in_docstring
         if rel_path.endswith((".py", ".pyi")):

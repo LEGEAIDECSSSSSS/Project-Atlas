@@ -142,7 +142,7 @@ INTENT_WORDS = {
     "callers": {"callers", "caller", "calls", "called", "uses", "used", "usages", "usage",
                 "references", "invokes", "invoked"},
     "flow": {"flow", "flows", "trace", "traces", "pipeline", "lifecycle", "sequence",
-             "journey", "connects", "connect", "connected", "chain"},
+             "journey", "connects", "connect", "connected", "chain", "end-to-end"},
 }
 
 

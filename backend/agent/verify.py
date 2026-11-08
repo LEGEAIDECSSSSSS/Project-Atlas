@@ -6,6 +6,7 @@ import re
 from pathlib import PurePosixPath
 
 from agent.evidence import files_read, last_test_status
+from services.textlines import source_lines
 
 EXTENSIONS = (
     "py|java|js|jsx|ts|tsx|go|rs|cs|cpp|hpp|c|h|php|rb|swift|kt|kts|scala|sql|html|css|vue|svelte|"
@@ -44,15 +45,20 @@ HEDGE = re.compile(
 EVIDENCE_TABLE_REQUEST = re.compile(r"\bevidence\s+tables?\b", re.IGNORECASE)
 
 SOURCE_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:evidence\s+table|exact\s+file\s+paths?|exact\s+function\s+names?|"
-    r"code\s+excerpts?|quotations?|quote\s+proving|read\s+the\s+actual|"
-    r"actual\s+implementations?|"
-    r"trace\s+(?:an?\s+|the\s+|this\s+|each\s+|every\s+)?(?:[\w-]+\s+){0,3}requests?)\b",
+    r"\b(?:evidence\s+table|(?:exact\s+)?file\s+paths?|line\s+numbers?|"
+    r"exact\s+function\s+names?|code\s+excerpts?|quotations?|quote\s+proving|"
+    r"read\s+the\s+actual|actual\s+implementations?|"
+    r"trace\s+(?:an?\s+|the\s+|this\s+|each\s+|every\s+)?(?:[\w-]+\s+){0,4}"
+    r"(?:requests?|process(?:es)?|flows?|call\s+chains?))\b",
     re.IGNORECASE,
 )
 # The literal marker the evidence-table format uses. Case-sensitive on purpose: an everyday
 # sentence like "why is the file not found?" must not switch on strict mode.
 NOT_FOUND_MARKER = re.compile(r"\bNOT FOUND\b")
+PER_FUNCTION_LINE_REQUEST = re.compile(
+    r"\bfor\s+(?:every|each)\s+(?:relevant\s+)?(?:function|method)\b",
+    re.IGNORECASE,
+)
 
 
 def requires_source_evidence(user_message):
@@ -118,7 +124,7 @@ def _read_sources(evidence):
         match = re.match(r"\s*(\d+)-(\d+)\s*$", str(record.get("lines", "")))
         start = int(match.group(1)) if match else len(chunks.get(key, [])) + 1
         lines = chunks.setdefault(key, [])
-        for offset, line in enumerate(source.splitlines()):
+        for offset, line in enumerate(source_lines(source)):
             line_no = start + offset
             while len(lines) < line_no:
                 lines.append(None)
@@ -229,7 +235,51 @@ def _verify_evidence_table(answer, project_files, evidence):
     return notes
 
 
-def check_answer(answer, project_files, user_message, evidence, facts=None):
+def _verify_per_function_details(answer):
+    text = prose_only(answer or "")
+    entries = [e for e in parse_function_entries(text) if e.get("function")]
+    if not entries:
+        return [
+            "The answer did not provide separate Function, File Path and Line Numbers "
+            "references for the requested functions."
+        ]
+    if any(not e.get("path") or e.get("start") is None for e in entries):
+        return [
+            "A function is listed without both its project file path and line numbers, "
+            "so the requested per-function source reference is incomplete."
+        ]
+    return []
+
+
+def _relevant_incomplete(source_records, current_evidence, mentioned_files, evidence):
+    """True when an incomplete read matters for this answer.
+
+    Only this turn's reads are considered when ``current_evidence`` is given (stale history must
+    not veto a fresh answer), only for files the answer actually discusses, and only when no
+    complete read covers the incomplete range.
+    """
+    pool = source_records if current_evidence is None else [
+        r for r in current_evidence
+        if isinstance(r, dict) and r.get("tool") in ("read_project_file", "read_symbol")]
+    incomplete = [r for r in pool if not r.get("complete", True)]
+    if not incomplete:
+        return False
+    if current_evidence is None:
+        return True
+    names = {_basename(n) for n in mentioned_files}
+    intervals = _read_intervals(evidence)
+    for record in incomplete:
+        path = str(record.get("path") or "").replace("\\", "/")
+        if _basename(path) not in names:
+            continue
+        match = re.match(r"\s*(\d+)-(\d+)\s*$", str(record.get("lines", "")))
+        if match and _range_was_read(path, int(match.group(1)), int(match.group(2)), intervals):
+            continue
+        return True
+    return False
+
+
+def check_answer(answer, project_files, user_message, evidence, facts=None, current_evidence=None):
     """Return deterministic warnings for unsupported claims."""
     strict = requires_source_evidence(user_message or "")
     if not project_files:
@@ -297,8 +347,17 @@ def check_answer(answer, project_files, user_message, evidence, facts=None):
             notes.append(f"It says tests pass, but {words}.")
 
     if strict:
-        if not any(r.get("tool") in ("read_project_file", "read_symbol") for r in (evidence or [])):
+        source_records = [r for r in (evidence or [])
+                         if isinstance(r, dict) and r.get("tool") in ("read_project_file", "read_symbol")]
+        if not source_records:
             notes.append("No project source was actually read for this source-evidence request.")
+        if _relevant_incomplete(source_records, current_evidence, existing, evidence):
+            notes.append(
+                "At least one retrieved source range was incomplete, so the requested source trace "
+                "cannot be verified from the available code."
+            )
+        if PER_FUNCTION_LINE_REQUEST.search(user_message or ""):
+            notes.extend(_verify_per_function_details(answer))
         # Only enforce a table when the user explicitly requested that presentation format.
         if EVIDENCE_TABLE_REQUEST.search(user_message or ""):
             notes.extend(_verify_evidence_table(answer, project_files, evidence))
@@ -314,7 +373,88 @@ def check_answer(answer, project_files, user_message, evidence, facts=None):
 # ---------------------------------------------------------------------------
 
 BACKTICK = re.compile(r"(?<!`)`([^`\n]{2,80})`(?!`)")
+BOLD_IDENTIFIER = re.compile(r"\*\*([A-Za-z_$][\w$.]*)\*\*")
+FUNCTION_FIELD = re.compile(
+    r"(?:\*\*)?(?:function|method|symbol)(?:\s+name)?(?::\*\*|\*\*:|\s*[:=])"
+    r"\s*`?([A-Za-z_$][\w$.]*)`?", re.IGNORECASE,
+)
+LINE_FIELD = re.compile(
+    r"(?:\*\*)?(?:line\s+numbers?|lines?)(?::\*\*|\*\*:|\s*[:=])"
+    r"\s*`?(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?`?", re.IGNORECASE,
+)
 IDENT = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+PATH_FIELD = re.compile(
+    r"(?:\*\*)?(?:file(?:\s*path)?|path)(?::\*\*|\*\*:|\s*[:=])\s*`?"
+    rf"((?:[\w.-]{{1,80}}/){{0,12}}[\w-][\w.-]{{0,80}}\.(?:{EXTENSIONS}))(?![\w])`?", re.IGNORECASE,
+)
+_TABLE_ROW = re.compile(r"^\s*\|(.+)\|\s*$", re.MULTILINE)
+
+
+def _cell_text(value):
+    return re.sub(r"[`*]", "", value or "").strip()
+
+
+def _table_entries(text):
+    """Entries from a markdown table whose header names Function, File and Line columns."""
+    entries, header = [], None
+    for row in _TABLE_ROW.finditer(text):
+        cells = [_cell_text(c) for c in row.group(1).split("|")]
+        lowered = [c.lower() for c in cells]
+        if header is None:
+            fn = next((i for i, c in enumerate(lowered) if c in ("function", "method", "symbol", "function name")), None)
+            fp = next((i for i, c in enumerate(lowered) if c in ("file path", "file", "path")), None)
+            ln = next((i for i, c in enumerate(lowered) if c.startswith("line")), None)
+            if fn is not None and fp is not None and ln is not None:
+                header = (fn, fp, ln)
+            continue
+        if all(set(c) <= set("-: ") for c in cells):
+            continue
+        fn, fp, ln = header
+        if max(fn, fp, ln) >= len(cells):
+            continue
+        name = cells[fn].split("(")[0].strip()
+        path = FILE_NAME.search(cells[fp])
+        lines = re.match(r"(\d{1,6})(?:\s*[-\u2013]\s*(\d{1,6}))?", cells[ln])
+        entries.append({
+            "function": name if IDENT.match(name.split(".")[-1] or "") else None,
+            "path": path.group(1).replace("\\", "/") if path else None,
+            "start": int(lines.group(1)) if lines else None,
+            "end": int(lines.group(2) or lines.group(1)) if lines else None,
+        })
+    return entries
+
+
+def parse_function_entries(text):
+    """Pair each function with the path and line range written inside its own entry.
+
+    Entries are split at the first label type the answer uses (Function-first or File-Path-first),
+    so a function is never matched with a neighbouring entry's path or lines. Markdown tables
+    with Function / File / Line columns are also understood.
+    """
+    text = text or ""
+    entries = _table_entries(text)
+    functions = list(FUNCTION_FIELD.finditer(text))
+    paths = list(PATH_FIELD.finditer(text))
+    if functions:
+        first_path = paths[0].start() if paths else 10**12
+        starters = functions if functions[0].start() <= first_path else paths
+        cut = [m.start() for m in starters] + [len(text)]
+        for begin, finish in zip(cut, cut[1:]):
+            block = text[begin:finish]
+            fn = FUNCTION_FIELD.search(block)
+            if not fn:
+                continue
+            path = PATH_FIELD.search(block) or FILE_NAME.search(block)
+            lines = LINE_FIELD.search(block)
+            entries.append({
+                "function": fn.group(1),
+                "path": path.group(1).replace("\\", "/") if path else None,
+                "start": int(lines.group(1)) if lines else None,
+                "end": int(lines.group(2) or lines.group(1)) if lines else None,
+            })
+    return entries
+
 _COMMON_NAMES = (
     set(keyword.kwlist) | set(dir(builtins))
     | {"self", "cls", "this", "null", "undefined", "true", "false", "async", "await", "const",
@@ -384,6 +524,57 @@ def _line_totals(evidence, facts):
     return totals
 
 
+def _read_intervals(evidence):
+    """Line ranges whose source was actually retained in full.
+
+    Incomplete records never count, and a record's range is clamped to the lines its retained
+    text really holds, so a declared range cannot vouch for text that was shortened away.
+    """
+    intervals = {}
+    for record in evidence or []:
+        if not isinstance(record, dict) or record.get("tool") not in ("read_project_file", "read_symbol"):
+            continue
+        if not record.get("complete", True):
+            continue
+        path = str(record.get("path") or "").replace("\\", "/")
+        match = re.match(r"\s*(\d+)-(\d+)\s*$", str(record.get("lines", "")))
+        if not (path and match):
+            continue
+        low, high = int(match.group(1)), int(match.group(2))
+        text = record.get("source_text")
+        if isinstance(text, str):
+            retained = len(source_lines(text))
+            if retained < high - low + 1:
+                high = low + retained - 1
+        if high >= low:
+            intervals.setdefault(path, []).append((low, high))
+    return intervals
+
+
+def _resolve_path(path, candidates):
+    """Map a cited path to a known project path: exact, else a unique path-suffix match."""
+    path = (path or "").replace("\\", "/").lstrip("./")
+    known = [str(c).replace("\\", "/") for c in candidates]
+    if path in known:
+        return path
+    hits = sorted({c for c in known if c.endswith("/" + path)})
+    return hits[0] if len(hits) == 1 else path
+
+
+def _range_was_read(path, start, end, intervals):
+    spans = sorted(intervals.get(path.replace("\\", "/"), []))
+    cursor = start
+    for low, high in spans:
+        if high < cursor:
+            continue
+        if low > cursor:
+            return False
+        cursor = max(cursor, high + 1)
+        if cursor > end:
+            return True
+    return cursor > end
+
+
 def _match_total(path, totals):
     path = path.replace("\\", "/")
     if path in totals:
@@ -410,7 +601,9 @@ def claim_items(answer, user_message="", evidence=None, facts=None):
     user_text = user_message or ""
 
     seen = set()
-    for match in BACKTICK.finditer(prose):
+    marked_names = list(BACKTICK.finditer(prose)) + list(BOLD_IDENTIFIER.finditer(prose))
+    marked_names.sort(key=lambda match: match.start())
+    for match in marked_names:
         raw = match.group(1).strip()
         if FILE_NAME.fullmatch(raw) or " " in raw or not _looks_like_code_name(raw):
             continue
@@ -446,6 +639,62 @@ def claim_items(answer, user_message="", evidence=None, facts=None):
                 "supported": not bad,
                 "detail": f"`{real}` has only {total} lines",
             })
+
+    # Structured answers commonly list File Path, Line Numbers and Function as separate
+    # fields. Validate that range against the source actually read, and when a function name
+    # is supplied, compare it with the index's exact definition range.
+    intervals = _read_intervals(evidence)
+    known_paths = (set(intervals) | set(totals)
+                   | {i.get("path") for locs in ((facts or {}).get("symbol_locations") or {}).values()
+                      for i in locs if isinstance(i, dict) and i.get("path")})
+
+    def judge_entry(path, start_line, end_line, function):
+        path = _resolve_path(path, known_paths)
+        detail = "the cited line range was not included in the source that was read"
+        supported = _range_was_read(path, start_line, end_line, intervals)
+        if supported and function:
+            name = _last_component(function)
+            locations = (facts or {}).get("symbol_locations", {}).get(name, [])
+            exact = [item for item in locations if item.get("path") == path]
+            if not exact:
+                supported = False
+                detail = f"`{name}` is not an indexed project definition in `{path}`"
+            else:
+                supported = any(item.get("start_line") == start_line and item.get("end_line") == end_line
+                                for item in exact)
+                detail = f"the indexed definition of `{name}` in `{path}` has a different line range"
+        if (path, start_line, end_line, function) not in cited:
+            cited.add((path, start_line, end_line, function))
+            label = f"{path}:{start_line}-{end_line}" + (f" ({_last_component(function)})" if function else "")
+            items.append({"kind": "line", "text": label, "supported": supported, "detail": detail})
+
+    entries = [e for e in parse_function_entries(prose) if e.get("path") and e.get("start") is not None]
+    if entries:
+        for entry in entries:
+            judge_entry(entry["path"], entry["start"], entry["end"], entry.get("function"))
+    else:
+        for path_match in FILE_NAME.finditer(prose):
+            path = path_match.group(1).replace("\\", "/")
+            next_path = FILE_NAME.search(prose, path_match.end())
+            stop = min(len(prose), path_match.end() + 260,
+                       next_path.start() if next_path else len(prose))
+            before = prose[max(0, path_match.start() - 180):path_match.start()]
+            section = prose[path_match.end():stop]
+            line_match = LINE_FIELD.search(section) or LINE_FIELD.search(before)
+            if not line_match:
+                continue
+            start_line = int(line_match.group(1))
+            end_line = int(line_match.group(2) or line_match.group(1))
+            previous_functions = list(FUNCTION_FIELD.finditer(before))
+            previous_function = previous_functions[-1] if previous_functions else None
+            next_function = FUNCTION_FIELD.search(section)
+            function_match = next_function
+            if previous_function:
+                previous_distance = len(before) - previous_function.end()
+                next_distance = (next_function.start() if next_function else 10**9)
+                if previous_distance <= next_distance:
+                    function_match = previous_function
+            judge_entry(path, start_line, end_line, function_match.group(1) if function_match else None)
 
     edges = set((facts or {}).get("call_edges") or [])
     if edges and symbols:

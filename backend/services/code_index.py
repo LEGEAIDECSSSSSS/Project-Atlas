@@ -23,11 +23,12 @@ from services import code_parsers as cp
 from services import project_service as ps
 from services import vocab
 from services.search_engine import TEST_PATH
+from services.textlines import source_lines
 
 MAX_INDEX_FILES = 6000
 MAX_INDEX_FILE_BYTES = 500_000
 MAX_CACHED_PROJECTS = 4
-TRACE_MAX_NODES = 10
+TRACE_MAX_NODES = 20
 ROLE_PATTERNS = [
     ("test", re.compile(r"(?:^|/)(?:tests?|spec|__tests__)(?:/|$)|test_|_test\.|\.test\.|\.spec\.|Tests?\.java$", re.I)),
     ("controller", re.compile(r"controller|router|routes?|views?|handlers?|endpoints?|(?:^|/)api(?:/|$)|resource", re.I)),
@@ -78,6 +79,7 @@ class ProjectIndex:
     entry_points: list = field(default_factory=list)      # [(path, EntryPoint)]
     imports_resolved: dict = field(default_factory=dict)  # path -> [(Import, [resolved paths])]
     imported_by: dict = field(default_factory=lambda: defaultdict(set))
+    router_prefixes: dict = field(default_factory=dict)  # path -> router variable -> URL prefix
     manifests: dict = field(default_factory=dict)         # path -> text (bounded)
     languages: dict = field(default_factory=dict)         # lang -> file count
     skipped_large: int = 0
@@ -143,8 +145,19 @@ def build_index(project_id):
 
         parsed = cp.parse_source(rel, text)
         parsed_files += 1
-        info = FileInfo(rel, language, size, len(text.splitlines()), parsed,
+        info = FileInfo(rel, language, size, len(source_lines(text)), parsed,
                         bool(TEST_PATH.search(rel)), role_of(rel))
+        if language == "python":
+            prefixes = {}
+            for match in re.finditer(
+                r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*(?:APIRouter|Blueprint|Router)\s*\((.*?)\)",
+                text, re.DOTALL,
+            ):
+                prefix = re.search(r"\bprefix\s*=\s*(['\"])(.*?)\1", match.group(2), re.DOTALL)
+                if prefix:
+                    prefixes[match.group(1)] = prefix.group(2)
+            if prefixes:
+                index.router_prefixes[rel] = prefixes
         index.files[rel] = info
         index.languages[language] = index.languages.get(language, 0) + 1
 
@@ -408,7 +421,7 @@ def read_symbol(project_id, path=None, name=None, line=None, max_chars=None):
         raise ValueError("Give 'name', or both 'path' and 'line'.")
 
     text = ps.read_project_file(project_id, path)
-    lines = text.splitlines()
+    lines = source_lines(text)
     total = len(lines)
     info = index.files.get(path)
 
@@ -527,7 +540,7 @@ def find_references(project_id, name, limit=30, offset=0):
     for rel, text in _iter_text_files(project_id, index):
         if name not in text:
             continue
-        for number, line in enumerate(text.splitlines(), start=1):
+        for number, line in enumerate(source_lines(text), start=1):
             if regex.search(line):
                 refs.append({"path": rel, "line": number,
                              "content": line.strip()[:240],
@@ -563,17 +576,78 @@ def find_callers(project_id, name, limit=30, offset=0):
             "callers": page, "note": note, **meta}
 
 
+def _self_attribute_type(index, from_path, call):
+    """Infer a self/cls attribute's constructed type from its owning class initializer."""
+    qualifier = (call.qualifier or "").strip()
+    match = re.match(r"^(?:self|cls)\.([A-Za-z_]\w*)$", qualifier)
+    if not match or "." not in (call.caller or ""):
+        return None
+    attribute = match.group(1)
+    owner_name = call.caller.rsplit(".", 1)[0]
+    owner = next((symbol for path, symbol in index.by_name.get(owner_name, [])
+                  if path == from_path and symbol.kind == "class"), None)
+    if owner is None:
+        return None
+    try:
+        source = ps.read_project_file(index.project_id, from_path)
+        class_lines = source_lines(source)[owner.start - 1:owner.end]
+    except (OSError, ValueError, FileNotFoundError):
+        return None
+
+    prefix = rf"(?:self|cls)\.{re.escape(attribute)}"
+    constructed = re.search(
+        prefix + rf"\s*(?::\s*[A-Za-z_]\w*)?\s*=\s*"
+        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(",
+        "\n".join(class_lines),
+    )
+    if constructed:
+        return constructed.group(1).rsplit(".", 1)[-1]
+    annotated = re.search(prefix + r"\s*:\s*([A-Za-z_]\w*)", "\n".join(class_lines))
+    return annotated.group(1) if annotated else None
+
+
 def _resolve_callee(index, from_path, call):
     candidates = [(p, s) for p, s in index.by_name.get(call.callee, [])
                   if s.kind in ("function", "method", "class", "component")]
     if not candidates:
         return []
+
+    # Attribute calls such as service.login() must not resolve back to the current
+    # controller's login() merely because the names match. Likewise, request.headers.get()
+    # must not be linked to an unrelated repository.get() elsewhere in the project.
+    qualifier = (call.qualifier or "").strip()
     same = [c for c in candidates if c[0] == from_path]
+    if qualifier and qualifier not in {"self", "cls", "super", "this"}:
+        same = [c for c in same if c[1].qualname != call.caller]
     if same:
         return same
+
     imported = {t for _imp, targets in index.imports_resolved.get(from_path, []) for t in targets}
     near = [c for c in candidates if c[0] in imported]
-    return near or candidates
+    if near:
+        receiver_type = _self_attribute_type(index, from_path, call)
+        if receiver_type:
+            typed = [c for c in near if c[1].parent == receiver_type
+                     or c[1].qualname.startswith(receiver_type + ".")]
+            if typed:
+                return typed
+        return near
+
+    # A simple receiver (e.g. an injected `service`) may have a type supplied through a
+    # dependency alias rather than a direct import. Keep the fallback for that case, but
+    # never guess targets for dotted framework/data objects such as request.headers.
+    if qualifier and "." in qualifier:
+        return []
+    if qualifier:
+        external = [c for c in candidates if c[0] != from_path]
+        # A simple variable named `service` usually holds a service-layer dependency.
+        # Prefer that layer over unrelated same-named frontend callbacks or controllers.
+        if qualifier.lower() in {"service", "authservice", "userservice", "repository", "repo"}:
+            preferred = [c for c in external if index.files.get(c[0])
+                         and index.files[c[0]].role in {"service", "data"}]
+            return preferred or external
+        return external
+    return candidates
 
 
 def find_callees(project_id, name, path=None, limit=40, offset=0):
@@ -703,13 +777,42 @@ def _chain_from(index, start_path, start_symbol, depth):
     return nodes, edges
 
 
-def trace_route(project_id, query, depth=2, limit=3):
-    """Find routes matching a path/keyword/handler and follow them handler -> services -> data."""
+def _effective_route_path(index, path, route):
+    receiver_match = re.search(r"\(([^)]+)\)", route.framework or "")
+    receiver = receiver_match.group(1).strip() if receiver_match else ""
+    prefix = index.router_prefixes.get(path, {}).get(receiver, "")
+    return _norm_route((prefix.rstrip("/") + "/" + route.path.lstrip("/")) if prefix else route.path)
+
+
+def _api_path_matches(route_path, api_path):
+    route_path, api_path = _norm_route(route_path), _norm_route(api_path)
+    return bool(route_path and api_path and (
+        route_path == api_path or route_path.endswith(api_path)
+        or api_path.endswith(route_path)
+    ))
+
+
+def _enclosing_symbols(index, path, line):
+    info = index.files.get(path)
+    if not info:
+        return []
+    return sorted(
+        [symbol for symbol in info.parsed.symbols if symbol.start <= line <= symbol.end],
+        key=lambda symbol: (symbol.end - symbol.start, -symbol.start),
+    )
+
+
+def trace_route(project_id, query, depth=3, limit=3):
+    """Trace a backend route, including router prefixes and frontend API callers.
+
+    Frontend HTTP-client calls are not server routes. Their enclosing functions and
+    caller components are returned separately so the UI -> API -> backend path stays clear.
+    """
     index = get_index(project_id)
     query = str(query or "").strip()
     if not query:
         raise ValueError("A route path, handler name or keyword is required.")
-    depth = max(1, min(int(depth or 2), 3))
+    depth = max(1, min(int(depth or 3), 4))
 
     words = [w for w in vocab.split_identifier(query) if w not in vocab.STOPWORDS
              and w not in vocab.QUESTION_NOISE] or vocab.split_identifier(query)
@@ -717,14 +820,17 @@ def trace_route(project_id, query, depth=2, limit=3):
 
     scored = []
     for path, route in index.routes:
+        effective_path = _effective_route_path(index, path, route)
         score = 0
-        route_tokens = set(vocab.split_identifier(route.path))
+        route_tokens = set(vocab.split_identifier(route.path + " " + effective_path))
         handler_tokens = set(vocab.split_identifier(route.handler))
         file_tokens = set(vocab.split_identifier(path))
-        if wanted_path and _norm_route(route.path) == _norm_route(wanted_path):
-            score += 20
-        elif wanted_path and wanted_path.strip("/") and wanted_path.strip("/") in route.path:
-            score += 8
+        if wanted_path and effective_path == _norm_route(wanted_path):
+            score += 30
+        elif wanted_path and _norm_route(wanted_path).strip("/") and (
+            _norm_route(wanted_path).strip("/") in effective_path.strip("/")
+        ):
+            score += 10
         for word in words:
             if word in route_tokens:
                 score += 4
@@ -733,11 +839,11 @@ def trace_route(project_id, query, depth=2, limit=3):
             if word in file_tokens:
                 score += 1
         if score:
-            scored.append((-score, path, route.line, route))
-    scored.sort(key=lambda s: s[:3])
+            scored.append((-score, path, route.line, route, effective_path))
+    scored.sort(key=lambda item: item[:3])
 
     results = []
-    for _neg, path, _line, route in scored[:max(1, min(int(limit or 3), 5))]:
+    for _neg, path, _line, route, effective_path in scored[:max(1, min(int(limit or 3), 5))]:
         entry = _handler_symbol(index, path, route.handler)
         chain = [{"role": "route", "path": path, "symbol": route.handler, "kind": "route",
                   "start_line": route.line, "end_line": route.line}]
@@ -746,21 +852,90 @@ def trace_route(project_id, query, depth=2, limit=3):
             handler_path, handler = entry
             chain[0].update({"path": handler_path, "start_line": handler.start,
                              "end_line": handler.end, "symbol": handler.qualname,
-                             "role": _role_label(handler_path, handler.name) if _role_label(handler_path) != "source" else "handler"})
+                             "role": _role_label(handler_path, handler.name)
+                             if _role_label(handler_path) != "source" else "handler"})
             files = [(handler_path, handler.start, handler.end)]
             nodes, edges = _chain_from(index, handler_path, handler, depth)
             chain.extend(nodes)
             files.extend((n["path"], n["start_line"], n["end_line"]) for n in nodes)
-        norm = _norm_route(route.path)
-        frontend = [{"path": p, "line": a.line, "method": a.method, "request_path": a.path}
-                    for p, a in index.api_calls if _norm_route(a.path) == norm
-                    and a.method in (route.method, "GET" if route.method in ("ANY", "ALL") else route.method)]
+
+        frontend = []
+        frontend_chains = []
+        frontend_providers = []
+        frontend_ui_callers = []
+        frontend_ui_chains = []
+        for frontend_path, info in index.files.items():
+            # Discover client-side request sites from parsed HTTP calls, not directory names.
+            # Projects commonly wrap their source tree in an archive root (or use client/,
+            # web/, ui/, etc.); a path-prefix check silently loses those callers.
+            if info.lang not in {"javascript", "typescript"} or info.parsed.routes:
+                continue
+            for api_call in info.parsed.api_calls:
+                if api_call.method not in (route.method, "GET" if route.method in ("ANY", "ALL") else route.method):
+                    continue
+                if not _api_path_matches(effective_path, api_call.path):
+                    continue
+                enclosing = _enclosing_symbols(index, frontend_path, api_call.line)
+                leaf = enclosing[0] if enclosing else None
+                caller_record = {"path": frontend_path, "line": api_call.line,
+                                 "method": api_call.method, "request_path": api_call.path}
+                if leaf:
+                    caller_record.update({"symbol": leaf.qualname, "start_line": leaf.start,
+                                          "end_line": leaf.end})
+                    for parent in enclosing[1:]:
+                        if parent.kind == "component":
+                            provider = {"path": frontend_path, "symbol": parent.qualname,
+                                        "start_line": parent.start, "end_line": parent.end}
+                            if provider not in frontend_providers:
+                                frontend_providers.append(provider)
+                    nodes, frontend_edges = _chain_from(index, frontend_path, leaf, min(depth, 2))
+                    frontend_chains.append({"path": frontend_path, "symbol": leaf.qualname,
+                                            "start_line": leaf.start, "end_line": leaf.end,
+                                            "api_call_line": api_call.line,
+                                            "chain": nodes, "edges": frontend_edges})
+                    files.append((frontend_path, leaf.start, leaf.end))
+                    files.extend((n["path"], n["start_line"], n["end_line"]) for n in nodes)
+
+                    # The page-level submit handler usually calls the context callback. Find
+                    # actual frontend callers of that callback and include their enclosing UI.
+                    for call_path, call in index.calls_by_callee.get(leaf.name, []):
+                        caller_info = index.files.get(call_path)
+                        if not caller_info or caller_info.lang != info.lang:
+                            continue
+                        call_symbols = _enclosing_symbols(index, call_path, call.line)
+                        if not call_symbols:
+                            continue
+                        ui_leaf = call_symbols[0]
+                        item = {"path": call_path, "symbol": ui_leaf.qualname,
+                                "kind": ui_leaf.kind, "start_line": ui_leaf.start,
+                                "end_line": ui_leaf.end, "called_at": call.line,
+                                "is_parent": False}
+                        if item not in frontend_ui_callers:
+                            frontend_ui_callers.append(item)
+                        for parent in call_symbols[1:]:
+                            if parent.kind == "component":
+                                parent_item = {"path": call_path, "symbol": parent.qualname,
+                                               "kind": parent.kind, "start_line": parent.start,
+                                               "end_line": parent.end, "called_at": call.line,
+                                               "is_parent": True}
+                                if parent_item not in frontend_ui_callers:
+                                    frontend_ui_callers.append(parent_item)
+                                ui_nodes, ui_edges = _chain_from(index, call_path, parent, 1)
+                                frontend_ui_chains.append({"path": call_path, "symbol": parent.qualname,
+                                                           "chain": ui_nodes, "edges": ui_edges})
+                        files.append((call_path, ui_leaf.start, ui_leaf.end))
+                frontend.append(caller_record)
+
         results.append({
-            "method": route.method, "route": route.path, "declared_at": f"{path}:{route.line}",
-            "framework": route.framework, "handler": route.handler,
-            "handler_resolved": entry is not None, "chain": chain, "edges": edges[:30],
-            "frontend_callers": frontend[:6],
-            "files_to_read": [{"path": p, "start_line": s, "end_line": e} for p, s, e in files],
+            "method": route.method, "route": route.path, "effective_route": effective_path,
+            "declared_at": f"{path}:{route.line}", "framework": route.framework,
+            "handler": route.handler, "handler_resolved": entry is not None,
+            "chain": chain, "edges": edges[:30], "frontend_callers": frontend[:6],
+            "frontend_chains": frontend_chains[:6],
+            "frontend_providers": frontend_providers[:6],
+            "frontend_ui_callers": frontend_ui_callers[:8],
+            "frontend_ui_chains": frontend_ui_chains[:8],
+            "files_to_read": [{"path": p, "start_line": a, "end_line": b} for p, a, b in files],
         })
 
     fallback = []
@@ -773,8 +948,7 @@ def trace_route(project_id, query, depth=2, limit=3):
         fallback = fallback[:10]
     return {"project_id": project_id, "query": query, "routes": results,
             "total_routes_indexed": len(index.routes),
-            "matching_routes": len(scored),
-            "related_symbols": fallback,
+            "matching_routes": len(scored), "related_symbols": fallback,
             "note": None if results else
             ("No declared route matches; related function names are listed instead."
              if fallback else "No route declaration or function matched. Routes are detected for "
@@ -808,7 +982,7 @@ def find_tests_for_symbol(project_id, name, limit=20):
         if last not in text:
             continue
         hits = []
-        for number, line in enumerate(text.splitlines(), start=1):
+        for number, line in enumerate(source_lines(text), start=1):
             if regex.search(line):
                 hits.append({"line": number, "content": line.strip()[:200]})
         if hits:
@@ -941,8 +1115,16 @@ def project_facts(project_id):
     for callee, entries in index.calls_by_callee.items():
         for _path, call in entries:
             edges.add((_last_name(call.caller), callee))
+    symbol_locations = defaultdict(list)
+    for path, info in index.files.items():
+        for symbol in info.parsed.symbols:
+            symbol_locations[symbol.name].append({
+                "path": path, "qualname": symbol.qualname, "kind": symbol.kind,
+                "start_line": symbol.start, "end_line": symbol.end,
+            })
     facts = {
         "symbols": set(index.by_name),
+        "symbol_locations": dict(symbol_locations),
         "files": set(index.all_paths),
         "call_edges": edges,
         "line_counts": {p: i.line_count for p, i in index.files.items()},

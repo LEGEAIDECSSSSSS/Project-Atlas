@@ -9,6 +9,7 @@ import re
 
 import config
 from services import code_parsers
+from services.textlines import source_lines
 
 MAX_RECORDS = 40
 
@@ -97,17 +98,46 @@ GRAPH_TOOLS = {
 }
 
 
+MAX_SOURCE_CHARS = 12000
+
+
+def _declared_span(lines):
+    """Return (start, end) from a ``"a-b"`` range string, or None when it is not numeric."""
+    match = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", str(lines or ""))
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    return (start, end) if end >= start else None
+
+
 def _read_record(tool_name, path, lines, total, complete, content, symbol=None):
+    """Build one source-read record.
+
+    ``complete`` is only kept when the retained text really holds every line of the declared
+    range. A record whose text was shortened, or whose line count disagrees with its declared
+    range, is demoted to incomplete so no later stage can treat it as full coverage.
+    """
+    retained_text = content[:MAX_SOURCE_CHARS]
+    truncated = len(content) > MAX_SOURCE_CHARS
+    if truncated:
+        # Keep whole lines only, so retained_lines describes exactly what is stored.
+        cut = retained_text.rfind("\n")
+        retained_text = retained_text[:cut] if cut > 0 else retained_text
+    retained_lines = len(source_lines(retained_text))
+    span = _declared_span(lines)
+    covers_range = span is not None and retained_lines == span[1] - span[0] + 1
     record = {
         "tool": "read_project_file",
         "path": path,
         "lines": lines,
         "of": total,
-        "complete": complete,
+        "complete": bool(complete) and not truncated and covers_range,
+        "retained_lines": retained_lines,
         "outline": outline(content, path=path),
-        # Keep a bounded copy so strict evidence checks can validate source excerpts.
-        "source_text": content[:12000],
+        "source_text": retained_text,
     }
+    if truncated:
+        record["source_truncated"] = True
     if symbol:
         record["symbol"] = symbol
     return record

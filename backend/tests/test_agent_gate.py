@@ -155,6 +155,87 @@ def tool_json(name, **arguments):
 SEARCH_RUN = tool_json("search_project", query="run_agent_stream")
 
 
+def test_exact_function_signature_body_and_line_request_is_answered_from_index():
+    source = "\n".join([
+        "from typing import Any",                 # 1
+        "",                                        # 2
+        "def login(body: Any):",                   # 3
+        "    user = authenticate(body)",           # 4
+        "    return user",                         # 5
+        "",                                        # 6
+        "def helper():",                           # 7
+        "    return 'must not be included'",       # 8
+    ])
+    world = World({"app/controllers/auth_controller.py": source})
+    prompt = (
+        "Inspect the login function in app/controllers/auth_controller.py. "
+        "Return the complete function signature, complete function body, and "
+        "starting and ending line numbers. Do not read or return the entire file."
+    )
+
+    try:
+        out = run(prompt, [], world=world, close=False)
+
+        # Full request path: classify the exact request, resolve the path, read the
+        # real indexed symbol, assemble its source lines, and render the answer.
+        # No LLM call is needed because the requested output is deterministic.
+        assert out.model_calls == 0
+        assert len(out.tools) == 1
+        assert out.tools[0]["name"] == "read_symbol"
+        assert "function `login`" in out.text
+        assert "lines 3–5 (complete)" in out.text
+        assert "def login(body: Any):" in out.text
+        assert "    user = authenticate(body)" in out.text
+        assert "    return user" in out.text
+        assert "def helper():" not in out.text
+        assert "must not be included" not in out.text
+        assert "from typing import Any" not in out.text
+    finally:
+        world.close()
+
+
+def test_named_symbol_wording_variants_use_read_symbol_end_to_end():
+    source = "\n".join([
+        "from typing import Any",
+        "", "class Login:", "    def execute(self):", "        return 'class target'", "",
+        "def helper():", "    return 'helper'", "",
+        "def login(body: Any):", "    user = authenticate(body)", "    return user", "",
+        "def unrelated():", "    return 'must not be included in a symbol read'", "",
+    ])
+    world = World({"app/controllers/auth_controller.py": source})
+    cases = (
+        ("Inspect the login function in app/controllers/auth_controller.py.", "def login(body: Any):"),
+        ("Inspect function login in app/controllers/auth_controller.py.", "def login(body: Any):"),
+        ("Inspect the function named login in app/controllers/auth_controller.py.", "def login(body: Any):"),
+        ("Inspect the Login class in app/controllers/auth_controller.py.", "class Login:"),
+    )
+
+    try:
+        for prompt, expected_source in cases:
+            with __import__("unittest").TestCase().subTest(prompt=prompt):
+                out = run(
+                    prompt,
+                    ["Retrieved the requested definition."],
+                    world=world,
+                    close=False,
+                )
+
+                # Exercise the complete path: natural-language request -> classification ->
+                # named-file prefetch -> actual code-index tool -> context -> model response.
+                read_events = [event for event in out.tools
+                               if event["name"] in ("read_symbol", "read_project_file")]
+                assert len(read_events) == 1
+                assert read_events[0]["name"] == "read_symbol"
+
+                model_prompt = "\n".join(message["content"] for message in out.model.calls[0])
+                assert expected_source in model_prompt
+                assert "def unrelated():" not in model_prompt
+                assert "def helper():" not in model_prompt
+                assert out.text == "Retrieved the requested definition."
+    finally:
+        world.close()
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -223,6 +304,26 @@ class ClassifyTests(unittest.TestCase):
     def test_original_failing_request(self):
         r = self.c("Read the first 20 lines of backend/agent/agent.py.")
         self.assertEqual((r.kind, r.paths, r.ranges, r.pure), ("read", ["backend/agent/agent.py"], [(1, 20)], True))
+
+    def test_named_symbol_wording_variants_are_classified(self):
+        cases = (
+            ("Inspect the login function in backend/agent/agent.py.", "login"),
+            ("Inspect function login in backend/agent/agent.py.", "login"),
+            ("Inspect the function named login in backend/agent/agent.py.", "login"),
+            ("Inspect the Login class in backend/agent/agent.py.", "Login"),
+            ("Read method refresh in backend/agent/agent.py.", "refresh"),
+            ("Show AuthService class in backend/agent/agent.py.", "AuthService"),
+        )
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                requirement = self.c(prompt)
+                self.assertEqual(requirement.kind, "read")
+                self.assertEqual(requirement.symbol, expected)
+
+    def test_symbol_extractor_skips_grammar_words_and_finds_later_name(self):
+        self.assertEqual(A.requested_symbol("Inspect the login function in auth_controller.py."), "login")
+        self.assertEqual(A.requested_symbol("Inspect function login in auth_controller.py."), "login")
+        self.assertIsNone(A.requested_symbol("Inspect the function in auth_controller.py."))
 
     def test_multiple_files_are_all_tracked(self):
         r = self.c("Compare backend/agent/agent.py and backend/agent/verify.py")
@@ -967,3 +1068,47 @@ class LoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SymbolReadRenderingTests(unittest.TestCase):
+    def _symbol_result(self, end=72, truncated=False):
+        return {
+            "project_id": PROJECT,
+            "path": "app/controllers/auth_controller.py",
+            "total_lines": 105,
+            "start_line": 65,
+            "end_line": end,
+            "symbol_end_line": 72,
+            "name": "login",
+            "qualname": "login",
+            "kind": "function",
+            "truncated": truncated,
+            "content": "\n".join(f"source line {n}" for n in range(65, end + 1)),
+        }
+
+    def test_complete_symbol_does_not_claim_rest_of_file_is_missing(self):
+        req = A.Requirement(
+            kind="read", paths=["app/controllers/auth_controller.py"],
+            resolved=["app/controllers/auth_controller.py"], symbol="login",
+        )
+        tracker = A.RetrievalTracker(req)
+        self.assertTrue(tracker.record("read_symbol", self._symbol_result()))
+        self.assertTrue(tracker.satisfied())
+
+        answer = A.render_read_answer(req, tracker)
+        self.assertIn("function `login`, lines 65–72 (complete)", answer)
+        self.assertNotIn("cut at the size limit", answer)
+        self.assertNotIn("of 105", answer)
+
+    def test_truncated_symbol_is_reported_against_symbol_end_not_file_end(self):
+        req = A.Requirement(
+            kind="read", paths=["app/controllers/auth_controller.py"],
+            resolved=["app/controllers/auth_controller.py"], symbol="login",
+        )
+        tracker = A.RetrievalTracker(req)
+        self.assertTrue(tracker.record("read_symbol", self._symbol_result(end=69, truncated=True)))
+        self.assertFalse(tracker.satisfied())
+
+        answer = A.render_read_answer(req, tracker)
+        self.assertIn("function `login`, lines 65–72 (INCOMPLETE)", answer)
+        self.assertIn("retrieved lines 65–69 only", answer)
+        self.assertNotIn("of 105", answer)

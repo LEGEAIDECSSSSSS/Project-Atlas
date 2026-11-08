@@ -9,6 +9,7 @@ break indexing of a whole project.
 import ast
 import re
 from dataclasses import dataclass, field
+from services.textlines import source_lines
 
 LANG_BY_EXT = {
     ".py": "python", ".pyi": "python",
@@ -156,7 +157,7 @@ def parse_python(text, path=""):
         parsed.parser = "generic (python syntax error)"
         return parsed
 
-    lines = text.splitlines()
+    lines = source_lines(text)
     out = Parsed(parser="python-ast")
     is_urls = path.rsplit("/", 1)[-1] == "urls.py"
 
@@ -281,6 +282,8 @@ def block_end(lines, start_index, max_lines=2500):
     opened = False
     in_str = None
     in_block_comment = False
+    paren_depth = 0
+    bracket_depth = 0
     last = min(len(lines), start_index + max_lines)
     for i in range(start_index, last):
         line = lines[i]
@@ -311,10 +314,18 @@ def block_end(lines, start_index, max_lines=2500):
                 continue
             if ch in "\"'`":
                 in_str = ch
-            elif ch == "{":
+            elif ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif ch == "{" and paren_depth == 0 and bracket_depth == 0:
                 depth += 1
                 opened = True
-            elif ch == "}":
+            elif ch == "}" and paren_depth == 0 and bracket_depth == 0:
                 depth -= 1
                 if opened and depth <= 0:
                     return i + 1
@@ -369,6 +380,86 @@ JS_ARROW = re.compile(
     r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*"
     r"(?:async\s*)?(?:function\b[^(]*\(|\([^)]*\)\s*(?::\s*[^=]+?)?=>|<[^>]*>\s*\(|"
     r"[A-Za-z_$][\w$]*\s*=>)")
+JS_WRAPPED_ARROW = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\(")
+
+
+def _wrapped_callback_body(lines, declaration_index, match_end):
+    """Find a block-bodied arrow callback inside the assigned wrapper call.
+
+    An expression callback such as ``useMemo(() => ({...}))`` is not the assigned
+    variable's function. Only a callback whose own body starts with ``{`` qualifies.
+    This distinction prevents nested arrows inside object literals from swallowing the
+    following declaration and producing a bogus symbol range.
+    """
+    depth = 1  # The wrapper call's matched opening parenthesis.
+    arrow_tail = None
+    for line_index in range(declaration_index, min(len(lines), declaration_index + 41)):
+        raw = lines[line_index]
+        fragment = raw[match_end:] if line_index == declaration_index else raw
+        clean = re.sub(
+            r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|//.*$|/\*.*?\*/""",
+            "", fragment,
+        )
+        if arrow_tail is None and "=>" in clean:
+            arrow_tail = clean.split("=>", 1)[1]
+        if arrow_tail is not None:
+            candidate = arrow_tail.strip()
+            if candidate:
+                if not candidate.startswith("{"):
+                    return None
+                return line_index, raw.find("{", raw.find("=>") + 2)
+            # Arrow and its body may be on separate lines.
+            if clean.strip() and "=>" not in clean:
+                candidate = clean.strip()
+                if not candidate.startswith("{"):
+                    return None
+                return line_index, raw.find("{")
+        depth += clean.count("(") - clean.count(")")
+        if depth <= 0 and arrow_tail is None:
+            return None
+    return None
+
+
+
+def _arrow_expression_end(lines, start_index, arrow_column):
+    """Return the last line of an expression-bodied arrow without crossing declarations."""
+    parens = brackets = braces = 0
+    saw_expression = False
+    for line_index in range(start_index, len(lines)):
+        raw = lines[line_index]
+        fragment = raw[arrow_column + 2:] if line_index == start_index else raw
+        if not fragment.strip():
+            if saw_expression:
+                continue
+            continue
+        # Remove comments and quoted strings before balancing delimiters.
+        clean = re.sub(
+            r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|//.*$|/\*.*?\*/""",
+            "", fragment,
+        )
+        if clean.strip():
+            saw_expression = True
+        parens += clean.count("(") - clean.count(")")
+        brackets += clean.count("[") - clean.count("]")
+        braces += clean.count("{") - clean.count("}")
+        if min(parens, brackets, braces) < 0:
+            return line_index + 1
+        if parens == brackets == braces == 0 and saw_expression:
+            # Operators and punctuation at the end indicate a continued expression.
+            if clean.rstrip().endswith(("=>", ".", "?.", ",", "?", ":", "+", "&&", "||", "??")):
+                continue
+            return line_index + 1
+    return len(lines) if saw_expression else None
+
+JS_OBJECT = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\{\s*$")
+JS_OBJECT_ARROW = re.compile(
+    r"^\s{2,}([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")
+JS_OBJECT_METHOD = re.compile(
+    r"^\s{2,}(?:async\s+)?(?:\*\s*)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{")
+JS_CONTROL_WORDS = frozenset({"if", "for", "while", "switch", "catch", "function", "return", "with", "else"})
 JS_CLASS = re.compile(
     r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)")
 JS_INTERFACE = re.compile(r"^\s*(?:export\s+)?(?:interface|enum|type)\s+([A-Za-z_$][\w$]*)")
@@ -399,11 +490,71 @@ def _line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
-def parse_js(text):
-    lines = text.splitlines()
+def _parse_js_raw(text):
+    lines = source_lines(text)
     out = Parsed(parser="js-scan")
     symbols = out.symbols
     class_ranges = []
+
+    # Named arrow callbacks passed to higher-order wrappers are real functions too.
+    # Detect the assignment and callback syntax rather than hard-coding a framework helper
+    # such as React's useCallback; this also supports memoizers and project-specific wrappers.
+    for index, line in enumerate(lines):
+        if len(line) > MAX_PARSED_LINE:
+            continue
+        callback = JS_WRAPPED_ARROW.match(line)
+        if callback:
+            body_start = _wrapped_callback_body(lines, index, callback.end())
+            if body_start is None:
+                continue
+            body_index, body_column = body_start
+            # Start brace matching at the callback's actual body, not at the wrapper call.
+            # The wrapper's opening parenthesis must not hide the callback's opening brace.
+            body_lines = [lines[body_index][body_column:]] + lines[body_index + 1:]
+            relative_end = block_end(body_lines, 0)
+            end = body_index + relative_end if relative_end is not None else None
+            symbols.append(Symbol(callback.group(1), callback.group(1), "function",
+                                  index + 1, end or index + 1, signature=line.strip()[:120],
+                                  end_known=end is not None))
+
+    # Arrow-function properties on exported API objects (for example api.post) are
+    # indexed as methods. This lets the call graph follow api.post -> request.
+    for index, line in enumerate(lines):
+        object_match = JS_OBJECT.match(line)
+        if not object_match:
+            continue
+        object_name = object_match.group(1)
+        object_end = block_end(lines, index)
+        if object_end is None:
+            continue
+        skip_until = -1
+        for property_index in range(index + 1, min(object_end, len(lines))):
+            property_match = JS_OBJECT_ARROW.match(lines[property_index])
+            if not property_match:
+                shorthand = JS_OBJECT_METHOD.match(lines[property_index])
+                if (shorthand and property_index >= skip_until
+                        and shorthand.group(1) not in CALL_KEYWORDS | JS_CONTROL_WORDS):
+                    method_end = block_end(lines, property_index)
+                    name = shorthand.group(1)
+                    symbols.append(Symbol(name, f"{object_name}.{name}", "method", property_index + 1,
+                                          method_end or property_index + 1, parent=object_name,
+                                          signature=lines[property_index].strip()[:120],
+                                          end_known=method_end is not None))
+                    skip_until = (method_end or property_index + 1) + 0
+                continue
+            prop_line = lines[property_index]
+            body_end = block_end(lines, property_index) if "{" in prop_line.split("=>", 1)[-1] else property_index + 1
+            property_name = property_match.group(1)
+            skip_until = max(skip_until, body_end or property_index + 1)
+            symbols.append(Symbol(property_name, f"{object_name}.{property_name}",
+                                  "method", property_index + 1, body_end or property_index + 1,
+                                  parent=object_name, signature=prop_line.strip()[:120],
+                                  end_known=body_end is not None))
+            expression = prop_line.split("=>", 1)[-1]
+            for call_match in re.finditer(r"(?<![\w$])([A-Za-z_$][\w$]*)\s*\(", expression):
+                callee = call_match.group(1)
+                if callee not in CALL_KEYWORDS:
+                    out.calls.append(Call(callee, property_index + 1, f"{object_name}.{property_name}"))
 
     for index, line in enumerate(lines):
         number = index + 1
@@ -417,10 +568,19 @@ def parse_js(text):
                                   end_known=end is not None))
             class_ranges.append((number, end or number, match.group(1)))
             continue
-        match = JS_FUNC.match(line) or JS_ARROW.match(line)
+        function_match = JS_FUNC.match(line)
+        arrow_match = JS_ARROW.match(line)
+        match = function_match or arrow_match
         if match and not line.startswith((" " * 8, "\t\t\t")):
             name = match.group(1)
-            end = block_end(lines, index)
+            if function_match:
+                end = block_end(lines, index)
+            else:
+                arrow_column = line.find("=>", match.end() - 2)
+                body_start = line[arrow_column + 2:].lstrip() if arrow_column >= 0 else ""
+                end = (block_end(lines, index) if body_start.startswith("{")
+                       else _arrow_expression_end(lines, index, arrow_column)
+                       if arrow_column >= 0 else number)
             kind = "component" if name[:1].isupper() else "function"
             symbols.append(Symbol(name, name, kind, number, end or number,
                                   signature=line.strip()[:120], end_known=end is not None))
@@ -457,16 +617,28 @@ def parse_js(text):
         for match in pattern.finditer(text):
             out.imports.append(Import(match.group(1), [], _line_of(text, match.start())))
 
+    object_receivers = {
+        m.group(1) for line in lines
+        if (m := re.match(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\{", line))
+    }
     for match in JS_ROUTE.finditer(text):
         receiver, verb, _q, path, rest = match.groups()
-        if not ROUTER_NAMES.match(receiver) or not path.startswith("/"):
+        if (not ROUTER_NAMES.match(receiver) or not path.startswith("/")
+                or receiver in object_receivers):
             continue
-        rest = rest or ""
-        if "=>" in rest or "function" in rest:
+        rest = (rest or "").strip()
+        # api.post('/path', {email, password}) is an HTTP client call, not an Express
+        # route. A server route must pass a callback or a named handler as its next arg.
+        if not rest or (rest.startswith("{") and "=>" not in rest and "function" not in rest):
+            continue
+        if "=>" in rest or re.search(r"\bfunction\b", rest):
             handler = "<inline>"
         else:
-            idents = re.findall(r"[A-Za-z_$][\w$.]*", rest)
-            handler = idents[-1].split(".")[-1] if idents else "<inline>"
+            first = rest.split(",", 1)[0].strip()
+            handler_match = re.match(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)", first)
+            if not handler_match:
+                continue
+            handler = handler_match.group(1).split(".")[-1]
         out.routes.append(Route(verb.upper(), path, handler, _line_of(text, match.start()),
                                 f"express ({receiver})"))
 
@@ -515,7 +687,7 @@ def _mapping_path(args):
 
 
 def parse_java(text):
-    lines = text.splitlines()
+    lines = source_lines(text)
     out = Parsed(parser="java-scan")
     symbols = out.symbols
     class_stack = []        # (name, start, end, kind, prefix)
@@ -612,7 +784,7 @@ GENERIC_DEF = re.compile(
 
 
 def parse_generic(text):
-    lines = text.splitlines()
+    lines = source_lines(text)
     out = Parsed(parser="generic")
     for index, line in enumerate(lines):
         if len(line) > MAX_PARSED_LINE:
@@ -653,3 +825,20 @@ def parse_source(path, text):
         except Exception:
             return Parsed(parser="failed")
     return Parsed(parser="none")
+
+
+def parse_js(text):
+    """Parse JS/TS and drop exact duplicate definitions (same name, start and end).
+
+    Several recognisers can describe one declaration; a duplicate would make a cited range
+    ambiguous for the index, the evidence packet and the verifier.
+    """
+    parsed = _parse_js_raw(text)
+    seen, unique = set(), []
+    for symbol in parsed.symbols:
+        key = (symbol.qualname, symbol.start, symbol.end)
+        if key not in seen:
+            seen.add(key)
+            unique.append(symbol)
+    parsed.symbols[:] = unique
+    return parsed
