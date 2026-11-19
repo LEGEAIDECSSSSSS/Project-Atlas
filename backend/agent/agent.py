@@ -11,6 +11,7 @@ from agent.context import fit_messages, prompt_tokens, record_actual
 from agent.planner import make_plan
 from agent import evidence as ev
 from agent.packet import build_packet
+from agent.finalize import build_addendum
 from agent.prompts import (
     CHAT_PROMPT, CODE_OUTPUT_RULES, FLOW_TRACE_SYSTEM_PROMPT, GROUNDING_RULES,
     SYSTEM_PROMPT, SYSTEM_PROMPT_COMPACT,
@@ -1541,9 +1542,29 @@ PROJECT_SIGNAL_RE = re.compile(
 )
 
 
+PROJECT_EVIDENCE_RE = re.compile(
+    r"\b(?:file\s+paths?|line\s+numbers?|source\s+code|actual\s+(?:source|code|call)|call\s+expressions?|"
+    r"invocation\s+locations?|function\s+definitions?|route\s+handlers?|"
+    r"(?:every|each|all)\s+(?:relevant\s+|related\s+|involved\s+)?(?:functions?|methods?|routes?|endpoints?)|"
+    r"(?:this|the|my|our)\s+(?:project|codebase|repo(?:sitory)?))\b",
+    re.IGNORECASE,
+)
+
+
+def _asks_about_the_project(message):
+    """True when a message that also contains a general-knowledge word ("difference", "versus") is clearly
+    about the attached project: it asks for evidence only a project can give, or it names several distinct
+    pieces of code ("frontend", "backend", "function", "file", "flow") at once."""
+    if PROJECT_EVIDENCE_RE.search(message):
+        return True
+    return len({w.lower() for w in PROJECT_SIGNAL_RE.findall(message)}) >= 3
+
+
 def _is_project_task(message, mode, analysis, terms):
     """Is this a substantive request about the attached project (rather than small talk)?"""
-    if GREETING_RE.match(message) or CONCEPTUAL_RE.search(message):
+    if GREETING_RE.match(message):
+        return False
+    if CONCEPTUAL_RE.search(message) and not _asks_about_the_project(message):
         return False
     text = _EMAIL_RE.sub(" ", _URL_RE.sub(" ", message))
     words = WORD_RE.findall(text)
@@ -2320,6 +2341,19 @@ async def _prefetch(state, tool_name, arguments, add_to_prompt=True):
 # The agent loop
 # --------------------------------------------------------------------------
 
+ATLAS_SECTION_RE = re.compile(r"\n---\n### Atlas (?:corrections to the answer above|-verified connections)")
+
+
+def strip_atlas_sections(text):
+    """Cut the sections Atlas appends after verification (corrections, verified connections, restored entries).
+
+    They are deterministic output, not something the model said. Replayed as history, a model tends to copy
+    them into its next answer, together with any wrong claim they sit next to.
+    """
+    match = ATLAS_SECTION_RE.search(text or "")
+    return text[:match.start()].rstrip() if match else text
+
+
 WITHHELD_MARKER = "Atlas could not provide a verified source-evidence answer."
 
 
@@ -2345,6 +2379,8 @@ def sanitize_history(history):
             if result and result[-1]["role"] == "user":
                 result.pop()
             continue
+        if item["role"] == "assistant":
+            item = {"role": "assistant", "content": strip_atlas_sections(item["content"])}
         result.append(item)
     return result
 
@@ -2368,6 +2404,65 @@ def _common_prefix(a, b):
             break
         n += 1
     return n
+
+
+def _select_flow_nodes(route, ranked):
+    """Which backend functions of the route's call graph belong in a flow trace.
+
+    ``ranked`` is ``[(relevance, chain_index, node)]``; relevance is the overlap between the user's
+    words and the node's name/path. Wording alone must not decide how deep a trace goes, so the
+    selection is structural:
+
+    * the route handler and every helper defined in the handler's own module;
+    * every node whose name matched the question (the original rule);
+    * the callees of the matched service-level functions, followed two levels deep (repository,
+      password, token and session helpers are reached this way even when the question never names them);
+    * minus single-function leaf modules that matched nothing (a time helper, a base-class ``add``):
+      plumbing that would only spend the evidence budget.
+
+    Cross-module guards called by the handler itself (rate limiting) stay out, as before.
+    """
+    chain = [n for n in route.get("chain", []) if isinstance(n, dict)]
+    nodes = {index: node for _rel, index, node in ranked}
+    if not nodes:
+        return ranked
+
+    def containing(site):
+        path, _, line = str(site or "").rpartition(":")
+        if not (path and line.isdigit()):
+            return None
+        for index, node in nodes.items():
+            if (node.get("path") == path and isinstance(node.get("start_line"), int)
+                    and node["start_line"] <= int(line) <= node.get("end_line", -1)):
+                return index
+        return None
+
+    callees = {}
+    for index, node in nodes.items():
+        caller = containing(node.get("called_from"))
+        if caller is not None and caller != index:
+            callees.setdefault(caller, set()).add(index)
+    lexical = {index for rel, index, _node in ranked if rel > 0}
+    handler_path = (chain[0] if chain else {}).get("path")
+    core = {index for index, node in nodes.items() if index == 0 or node.get("path") == handler_path}
+    per_file = {}
+    for index, node in nodes.items():
+        per_file.setdefault(node.get("path"), []).append(index)
+
+    def plumbing(index):
+        node = nodes[index]
+        return (index not in lexical and index not in core and len(per_file[node.get("path")]) == 1
+                and not callees.get(index))
+
+    if not lexical:
+        return [item for item in ranked if not plumbing(item[1])]
+    selected = set(core) | lexical
+    frontier = {index for index in lexical if index not in core}
+    for _depth in range(2):
+        frontier = {callee for index in frontier for callee in callees.get(index, ())
+                    if not plumbing(callee)} - selected
+        selected |= frontier
+    return [item for item in ranked if item[1] in selected]
 
 
 def _route_query_candidates(plan, project_paths, is_flow, symbol_names=()):
@@ -2583,9 +2678,12 @@ async def _investigate(state, requirement, message):
                         ))
                         relevance = len(request_terms & symbol_terms)
                         ranked_backend_nodes.append((relevance, node_index, node))
-                    relevant_nodes = [item for item in ranked_backend_nodes if item[0] > 0]
-                    if not relevant_nodes:
-                        relevant_nodes = ranked_backend_nodes
+                    # Relevance only ORDERS the reads (matching nodes first, then the rest in call order);
+                    # it never excludes a function the route actually calls. Filtering on the prompt's
+                    # wording made the depth of a trace depend on whether the user happened to repeat each
+                    # helper's vocabulary: a prompt that said "authentication service" and "route handler"
+                    # lost every repository, token and cookie helper. The read budget bounds the cost.
+                    relevant_nodes = _select_flow_nodes(route, ranked_backend_nodes)
                     for relevance, node_index, node in relevant_nodes:
                         # Only read backend definitions that relate to the requested flow.
                         # High-relevance service, repository, password, token, session and
@@ -2633,12 +2731,23 @@ async def _investigate(state, requirement, message):
                     for chain in route.get("frontend_chains", []):
                         add_range(chain.get("path"), chain.get("start_line"), chain.get("end_line"), priority=8)
                         api_call_site = f"{chain.get('path')}:{chain.get('api_call_line')}"
-                        for node in chain.get("chain", []):
-                            # The direct HTTP client method and request wrapper are part of
-                            # the request path. Incidental cache helpers are not required to
-                            # explain how the request reaches the server.
+                        chain_nodes = [n for n in chain.get("chain", []) if isinstance(n, dict)]
+                        # The direct HTTP client method (called at the API call line) and what it calls
+                        # one level down (the request wrapper) ARE the request path, whatever words the
+                        # question used. Incidental cache helpers are not required to explain how the
+                        # request reaches the server, so they are still only read when the question
+                        # names them.
+                        direct = [n for n in chain_nodes if n.get("called_from") == api_call_site and n.get("path")]
+
+                        def inside_direct(node, _direct=direct):
+                            path, _, line = str(node.get("called_from") or "").rpartition(":")
+                            return bool(line.isdigit()) and any(
+                                d.get("path") == path and isinstance(d.get("start_line"), int)
+                                and d["start_line"] <= int(line) <= d.get("end_line", -1) for d in _direct)
+
+                        for node in chain_nodes:
                             node_terms = set(vocab.split_identifier(node.get("symbol", "")))
-                            if node_terms & request_terms:
+                            if (node_terms & request_terms) or node in direct or inside_direct(node):
                                 add_range(node.get("path"), node.get("start_line"), node.get("end_line"), priority=9)
                             if node.get("called_from") == api_call_site and node.get("path"):
                                 api_client_paths.add(node.get("path"))
@@ -2791,7 +2900,7 @@ def _make_room_for_flow(state):
         del state.messages[1]
 
 
-FLOW_PACKET_MAX_CHARS = 16000
+FLOW_PACKET_MAX_CHARS = 24000
 FLOW_PACKET_MIN_CHARS = 1500
 
 
@@ -2811,7 +2920,11 @@ def _format_flow_evidence(state, summary=None):
             "verified within the available context and ask for a narrower trace or a larger "
             "context window."
         )
-    text, report = build_packet(state.turn_evidence, state.flow_route, available)
+    def analyze(verified, edges):
+        from agent import callflow
+        return callflow.describe(state.project_id, verified, edges)
+
+    text, report = build_packet(state.turn_evidence, state.flow_route, available, analyze)
     state.flow_packet_report = report
     if len(text) > available:
         return (
@@ -3272,9 +3385,22 @@ async def run_agent_stream(
                 except Exception:
                     summary = None
 
+            # Complete a verified per-function trace with the connection facts the model left out or
+            # could not establish (derived from the source, appended and labelled; never alters it).
+            addendum = ""
+            report = getattr(state, "flow_packet_report", None)
+            if report and report.get("definitions") and state.flow_route and active_project_id:
+                try:
+                    addendum = build_addendum(full, report["definitions"], active_project_id, state.flow_route)
+                except Exception:
+                    addendum = ""
+
             # Held-back answers are shown only now, after retries and verification.
             if not live:
-                yield {"type": "token", "text": full}
+                yield {"type": "token", "text": full + addendum}
+            elif addendum:
+                yield {"type": "token", "text": addendum}
+            full += addendum
 
             if notes:
                 extra = format_notes(notes)

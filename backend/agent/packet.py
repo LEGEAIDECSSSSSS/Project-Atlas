@@ -19,6 +19,15 @@ from services.textlines import source_lines
 SPAN = re.compile(r"\s*(\d+)\s*-\s*(\d+)\s*")
 DECLARATION_WINDOW = 6          # decorators/signature lines allowed before the name appears
 MAX_CALLSITE_SHARE = 0.25       # call sites never use more than this share of the budget
+ANALYSIS_LEGEND = ("`expr` = call as written. #N = definition N above. NOT project = external library or platform API "
+                   "[name]: a known dependency, not an unknown. RECURSIVE = calls itself. cannot be established = "
+                   "the source does not show what is called.")
+ANALYSIS_NOTE_ROOM = 210         # heading plus the omitted-lines note around the analysis lines
+ANALYSIS_SHARE = 0.30           # call analysis never uses more than this share of the budget
+
+
+def _leaf_name(symbol):
+    return str(symbol or "").rsplit(".", 1)[-1]
 
 
 def parse_span(value):
@@ -158,7 +167,7 @@ def _resolve_edges(route, definitions):
     return resolved
 
 
-def build_packet(records, route, budget_chars):
+def build_packet(records, route, budget_chars, analyze=None):
     """Return ``(text, report)``.
 
     Required definitions are included first, as exact line slices in request order. Spare budget
@@ -180,15 +189,25 @@ def build_packet(records, route, budget_chars):
         else:
             verified.append(definition)
     report["definitions"] = verified
-    base_gaps = [f"- `{e['symbol']}` | {e['path']} | {e['start']}-{e['end']} ({e['reason']})"
+    base_gaps = [f"`{e['symbol']}` ({e['path']}:{e['start']}-{e['end']})"
                  for e in report["missing"] + report["unverified"]]
 
     if not usable or not verified:
         text = ("ATLAS VERIFIED FLOW EVIDENCE\nNo complete, verified source for the requested trace was "
                 "retrieved. Do not invent code details or line numbers. Say what could not be verified.")
         if base_gaps:
-            text += "\nNOT VERIFIED:\n" + "\n".join(base_gaps)
+            text += "\nNOT VERIFIED: " + "; ".join(base_gaps)
         return text, report
+
+    # The call analysis is computed once but placed AFTER the required source (see below): the
+    # definitions and their numbered source always take priority over the analysis.
+    raw_analysis, expressions = {}, {}
+    if analyze is not None and verified:
+        try:
+            raw_analysis, expressions = analyze(verified, _resolve_edges(route, verified))
+        except Exception:                  # the analysis is an aid; a trace must still be produced
+            raw_analysis, expressions = {}, {}
+    analysis = {"lines": [], "omitted": 0, "replaces_sites": False}
 
     text_by_path = {}      # path -> {line_number: text}
     for record in usable:
@@ -222,14 +241,13 @@ def build_packet(records, route, budget_chars):
         blocks.sort(key=lambda b: (b[0], b[1], b[2]))
         return blocks
 
-    def compose(selected):
+    def compose(selected, sites=True):
         covered = []
         for d in verified:
             lines = selected.get(d["path"], set())
             covered.append(all(n in lines for n in range(d["start"], d["end"] + 1)))
         dropped = [d for d, ok in zip(verified, covered) if not ok]
-        gaps = base_gaps + [f"- `{d['symbol']}` | {d['path']} | {d['start']}-{d['end']}"
-                            " (its source did not fit in the context budget)" for d in dropped]
+        gaps = base_gaps + [f"`{d['symbol']}` ({d['path']}:{d['start']}-{d['end']}, did not fit)" for d in dropped]
         out = [
             "ATLAS VERIFIED FLOW EVIDENCE",
             "Every source line below starts with its real line number (`  65 | code`). Use ONLY this",
@@ -247,26 +265,42 @@ def build_packet(records, route, budget_chars):
             out.append(f"{number}. {d['kind']} `{d['symbol']}` | {d['path']} | {d['start']}-{d['end']}")
         out.append("")
         if gaps:
-            out.append("NOT VERIFIED (do not describe their implementation; say they could not be verified):")
-            out.extend(gaps)
+            out.append("NOT VERIFIED (source not retrieved or not fitting; do not describe their implementation, "
+                       "say they could not be verified): " + "; ".join(gaps))
             out.append("")
-        edges = _resolve_edges(route, verified)
+        edges = _resolve_edges(route, verified) if (sites and not analysis["replaces_sites"]) else []
         if edges:
             index = {id(d): n for n, d in enumerate(verified, 1)}
             out.append("VERIFIED CALL SITES (caller -> callee, by definition number; line is in the caller's file):")
             for source, target, _path, line in edges:
+                written = expressions.get((source["path"], line, _leaf_name(target["symbol"])))
+                # show the expression only when it says something the definition name does not
+                # (a receiver such as `self.sessions.create(...)`, not a plain `user_out(user)`)
+                differs = bool(written) and written.split("(")[0].replace("new ", "") != target["symbol"]
                 out.append(f"- #{index[id(source)]} `{source['symbol']}` -> #{index[id(target)]} "
-                           f"`{target['symbol']}` at line {line}")
+                           f"`{target['symbol']}` at line {line}" + (f", written `{written}`" if differs else ""))
+            out.append("")
+        if analysis["lines"]:
+            out.append("CALL ANALYSIS (derived by Atlas from the real source; line numbers are real). Use it for "
+                       "Connection and Data Flow:")
+            out.append(ANALYSIS_LEGEND)
+            out.extend(analysis["lines"])
+            if analysis["omitted"]:
+                out.append(f"({analysis['omitted']} lower-priority analysis lines omitted for space; do not describe "
+                           "calls that are not listed.)")
             out.append("")
         out.extend([
-            "ANSWER FORMAT: one entry per VERIFIED DEFINITION, in order, each with these labelled lines:",
+            "ANSWER FORMAT: one entry per VERIFIED DEFINITION, in order:",
             "**Function:** name",
             "**File Path:** exact path from VERIFIED DEFINITIONS",
             "**Line Numbers:** start-end from VERIFIED DEFINITIONS",
             "**Purpose:** what the numbered source shows it doing",
-            "**Connection:** the function that calls it / what it calls next (from CALL SITES)",
-            "Describe only what the numbered source shows. If something is not shown, say it could",
-            "not be verified. Do not add functions that are not in VERIFIED DEFINITIONS.",
+            "**Connection:** only calls THIS function itself makes, from CALL ANALYSIS: each as written, `name(...)`, and whether it is a project function "
+            "(name, file), an external library/platform API, recursive, or conditional (say when). Never call "
+            "an external library or platform API 'unverified'; say 'cannot be established' only for calls "
+            "listed that way.",
+            "**Data Flow:** values it receives/returns and where each goes (omit if none listed)",
+            "Use only the numbered source and CALL ANALYSIS; say what cannot be verified; add no other functions.",
             "",
         ])
         out.extend(block[3] for block in render_blocks(selected))
@@ -279,6 +313,30 @@ def build_packet(records, route, budget_chars):
         trial.setdefault(definition["path"], set()).update(range(definition["start"], definition["end"] + 1))
         if len(compose(trial)[0]) <= budget_chars:
             selected = trial
+    # Phase 1b: the call analysis takes the room left after the required source, up to its share.
+    if raw_analysis:
+        from agent import callflow
+        with_sites = len(compose(selected)[0])
+        without_sites = len(compose(selected, sites=False)[0])
+        cap = int(budget_chars * ANALYSIS_SHARE)
+        overhead = len(ANALYSIS_LEGEND) + ANALYSIS_NOTE_ROOM
+        # Mode A: the analysis REPLACES the call-site list (it carries the same edges, plus more),
+        # but only when every edge between the packet's definitions survives in it.
+        limit = min(cap, budget_chars - without_sites - overhead)
+        lines, omitted, lost = callflow.fit(raw_analysis, verified, limit) if limit > 300 else ([], 0, True)
+        replaces = bool(lines) and not lost
+        report["analysis"] = {"with_sites": with_sites, "without_sites": without_sites, "first_limit": limit,
+                              "budget": budget_chars, "mode": "replaces call sites" if replaces else "beside call sites"}
+        if not replaces:
+            # Mode B: keep the call sites, so the analysis spends its room on what they cannot say
+            # (recursion, conditions, external dependencies, data flow) instead of repeating edges.
+            limit = min(cap, budget_chars - with_sites - overhead)
+            lines, omitted, _ = (callflow.fit(raw_analysis, verified, limit, skip_ranks=(callflow.RANK_VERIFIED,))
+                                 if limit > 300 else ([], 0, True))
+        if lines:
+            analysis.update(lines=lines, omitted=omitted, replaces_sites=replaces)
+            if len(compose(selected)[0]) > budget_chars:           # never exceed the budget
+                analysis.update(lines=[], omitted=0, replaces_sites=False)
     # Phase 2: spare room adds the rest of each retrieved range as context (whole records only).
     for record in usable:
         trial = {p: set(v) for p, v in selected.items()}

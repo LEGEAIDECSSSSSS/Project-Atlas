@@ -452,6 +452,7 @@ def parse_function_entries(text):
                 "path": path.group(1).replace("\\", "/") if path else None,
                 "start": int(lines.group(1)) if lines else None,
                 "end": int(lines.group(2) or lines.group(1)) if lines else None,
+                "block": block,
             })
     return entries
 
@@ -586,6 +587,124 @@ def _match_total(path, totals):
     return None, None
 
 
+
+_CALL_TOKEN = re.compile(r"`([^`\n]*?([A-Za-z_$][\w$]*)\s*\([^`\n]*)`")
+_LINE_AFTER = re.compile(r"^[^`\n.;]{0,40}?\blines?\s+(\d{1,6})\b", re.IGNORECASE)
+_LINE_BEFORE = re.compile(r"\blines?\s+(\d{1,6})\s*[:,]?\s*$", re.IGNORECASE)
+_DECLARATION = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:def|function|class)\b")
+_NOT_A_CALL = frozenset({"if", "for", "while", "switch", "catch", "return", "function", "def", "class",
+                         "print", "typeof", "await", "new", "elif", "with", "lambda", "except"})
+
+
+
+_CALLS_PHRASE = re.compile(r"\b(?:calls?|invokes?)\s+(?=(.+?)(?:\.\s|\.$|;|\n|$))", re.IGNORECASE)
+_PHRASE_END = re.compile(
+    r"\b(?:which|that|to|for|with|when|if|so|in order|and\s+(?:then\s+)?(?:returns?|handles?|uses?|sets?|"
+    r"creates?|passes?|stores?|receives?|sends?|validates?|checks?|builds?|reads?|writes?))\b", re.IGNORECASE)
+_PROSE_STOP = frozenset({"the", "a", "an", "it", "its", "this", "that", "these", "them", "those", "both", "each",
+                         "then", "also", "and", "or", "method", "function", "functions", "methods", "api",
+                         "external", "library", "platform", "project", "which", "is", "are"})
+
+
+def _strip_parentheses(text):
+    previous = None
+    while previous != text:
+        previous, text = text, re.sub(r"\([^()]*\)|\{[^{}]*\}|\[[^\[\]]*\]", "", text)
+    return text
+
+
+def _prose_called_names(text):
+    """Identifiers an entry says the function calls, e.g. ``calls A, B.c and D which are ...``."""
+    names = []
+    for match in _CALLS_PHRASE.finditer(text):
+        if re.search(r"\b(?:not|never|n't|nothing|no)\s*$", text[max(0, match.start() - 8):match.start()], re.IGNORECASE):
+            continue
+        raw = _strip_parentheses(match.group(1))
+        end = _PHRASE_END.search(raw)
+        raw = raw[:end.start()] if end else raw
+        for item in re.split(r",|\band\b", raw, flags=re.IGNORECASE):
+            words = [w for w in re.sub(r"[`'\"*]", "", item).split() if w.lower() not in _PROSE_STOP]
+            if len(words) == 1 and re.fullmatch(r"[A-Za-z_$][\w$.]*", words[0]):
+                names.append(words[0])
+    return names
+
+def _retained_lines(path, start, end, evidence):
+    """{line number: text} for start..end when one COMPLETE record holds every one of those lines."""
+    for record in evidence or []:
+        if not isinstance(record, dict) or record.get("tool") not in ("read_project_file", "read_symbol"):
+            continue
+        if not record.get("complete", True) or str(record.get("path") or "").replace("\\", "/") != path:
+            continue
+        match = re.match(r"\s*(\d+)-(\d+)\s*$", str(record.get("lines", "")))
+        text = record.get("source_text")
+        if not (match and isinstance(text, str)):
+            continue
+        low, high = int(match.group(1)), int(match.group(2))
+        rows = source_lines(text)
+        if low <= start and end <= high and len(rows) >= high - low + 1:
+            return {low + i: rows[i] for i in range(len(rows)) if start <= low + i <= end}
+    return None
+
+
+def _connection_items(entries, evidence, resolve, project_symbols=frozenset()):
+    """Check the calls an entry's Connection / Data Flow text attributes to its own function.
+
+    Every backticked call written as ``name(...)`` must appear as a call in that function's own
+    retained source (declaration lines excluded); if it cites a line, that line must contain it.
+    Calls that cannot be checked because the function's source was not retained in full are
+    skipped rather than guessed at.
+    """
+    items = []
+    for entry in entries:
+        block, function = entry.get("block"), entry.get("function")
+        if not (block and function and entry.get("path") and entry.get("start") is not None):
+            continue
+        marker = re.search(r"(?:\*\*\s*)?\b(?:connections?|data\s*flows?)\s*(?:\*\*)?\s*:", block, re.IGNORECASE)
+        if not marker:
+            continue
+        path = resolve(entry["path"])
+        rows = _retained_lines(path, entry["start"], entry["end"], evidence)
+        if not rows:
+            continue
+        body = {n: t for n, t in rows.items() if not _DECLARATION.match(t)}
+        text = block[marker.start():]
+        name = _last_component(function)
+        for token in _CALL_TOKEN.finditer(text):
+            leaf = token.group(2)
+            if leaf in _NOT_A_CALL:
+                continue
+            # "Called by `login` (...) at line 71 as `set_auth_cookies(...)`": the backticked call is the
+            # CALLER's invocation of this function (an incoming edge), not a call this function makes.
+            sentence = re.split(r"\.\s|\n", text[:token.start()])[-1]
+            if re.search(r"called\s+by\b", sentence, re.IGNORECASE):
+                continue
+            pattern = re.compile(r"(?<![\w$])" + re.escape(leaf) + r"\s*\(")
+            found = [n for n, t in body.items() if pattern.search(t)]
+            after = _LINE_AFTER.match(text[token.end():token.end() + 60])
+            before = _LINE_BEFORE.search(text[max(0, token.start() - 24):token.start()])
+            cited = int((after or before).group(1)) if (after or before) else None
+            label = f"{name} -> {leaf}(...)"
+            if not found:
+                items.append({"kind": "connection", "text": label, "supported": False,
+                              "detail": f"no call to `{leaf}(...)` appears in `{name}` ({path}:{entry['start']}-{entry['end']}) "
+                                        "in the source that was read"})
+            elif cited is not None and cited not in found:
+                items.append({"kind": "connection", "text": f"{label} at line {cited}", "supported": False,
+                              "detail": f"line {cited} of `{name}` does not contain a call to `{leaf}(...)`"})
+            else:
+                items.append({"kind": "connection", "text": label, "supported": True, "detail": ""})
+        # the same claim written as plain prose: "calls generate_token which is a project function"
+        for token in dict.fromkeys(_prose_called_names(text)):
+            leaf = token.rsplit(".", 1)[-1]
+            if leaf not in project_symbols or leaf in _NOT_A_CALL or leaf == name:
+                continue
+            pattern = re.compile(r"(?<![\w$])" + re.escape(leaf) + r"\s*\(")
+            if not any(pattern.search(t) for t in body.values()):
+                items.append({"kind": "connection", "text": f"{name} -> {token}", "supported": False,
+                              "detail": f"`{name}` ({path}:{entry['start']}-{entry['end']}) does not call `{token}` "
+                                        "in the source that was read"})
+    return items
+
 def claim_items(answer, user_message="", evidence=None, facts=None):
     """Every checkable code claim in an answer: {kind, text, supported, detail}.
 
@@ -672,6 +791,8 @@ def claim_items(answer, user_message="", evidence=None, facts=None):
     if entries:
         for entry in entries:
             judge_entry(entry["path"], entry["start"], entry["end"], entry.get("function"))
+        items.extend(_connection_items(entries, evidence, lambda p: _resolve_path(p, known_paths),
+                                       frozenset((facts or {}).get("symbol_locations") or {})))
     else:
         for path_match in FILE_NAME.finditer(prose):
             path = path_match.group(1).replace("\\", "/")
@@ -724,6 +845,9 @@ def _claim_notes(answer, user_message, evidence, facts):
     for item in items:
         if item["kind"] == "line" and not item["supported"]:
             notes.append(f"It cites {item['text']}, but {item['detail']}.")
+    bad_calls = [i for i in items if i["kind"] == "connection" and not i["supported"]]
+    for item in bad_calls[:5]:
+        notes.append(f"It says `{item['text']}`, but {item['detail']}.")
     summary = summarize_items(items)
     if summary["checked"] >= 4 and summary["supported"] / summary["checked"] < 0.5:
         notes.append(

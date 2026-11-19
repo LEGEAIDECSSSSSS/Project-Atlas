@@ -1,3 +1,4 @@
+import re
 """Agent protocol and investigation: parsing, duplicates, route/startup tracing, pagination notes."""
 import json
 
@@ -437,7 +438,10 @@ def test_flow_trace_preserves_core_backend_evidence_in_the_final_model_prompt(pr
     assert "[older tool result shortened" not in final_prompt
     assert "ATLAS VERIFIED FLOW EVIDENCE" in final_prompt
     assert "VERIFIED DEFINITIONS" in final_prompt
-    assert "VERIFIED CALL SITES" in final_prompt
+    # Caller -> callee relationships must reach the model, either as the call-site list or, when it
+    # fits, inside CALL ANALYSIS (which carries the same edges with more detail).
+    assert "VERIFIED CALL SITES" in final_prompt or (
+        "CALL ANALYSIS" in final_prompt and re.search(r"-> #\d+ `", final_prompt))
     assert "SOURCE app/services/auth_service.py | lines 5-15 | COMPLETE" in final_prompt
     assert "TOOL RESULT" not in final_prompt
     for source_marker in (

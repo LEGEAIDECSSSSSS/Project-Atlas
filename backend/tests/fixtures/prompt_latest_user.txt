@@ -1,0 +1,9 @@
+Trace the complete login process, starting from the frontend login form and following it through the backend until the response is returned.
+
+For every relevant function, provide its exact file path, line numbers, purpose, connections and data flow.
+
+Verify the actual call expressions and distinguish function definitions from invocation locations.
+
+Explain the difference between values returned by the authentication service and values returned by the route handler.
+
+Do not invent connections or simplify function arguments. Use the actual source code as evidence.

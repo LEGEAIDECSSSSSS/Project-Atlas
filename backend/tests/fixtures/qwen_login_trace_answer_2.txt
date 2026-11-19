@@ -1,0 +1,23 @@
+Function: submit File Path: Team-Task-Board---Mini-Trello-main/frontend/src/pages/Login.jsx Line Numbers: 27-44 Purpose: Initiates the login request by calling the login function with email and password. Connection: Calls login(email, password) from Team-Task-Board---Mini-Trello-main/frontend/src/auth.jsx (line 40). Data Flow: Receives email and password; returns nothing.
+
+Function: login File Path: Team-Task-Board---Mini-Trello-main/frontend/src/auth.jsx Line Numbers: 38-44 Purpose: Sends the login request to the backend using the api.post method. Connection: Calls api.post('/auth/login', { email, password }) from Team-Task-Board---Mini-Trello-main/frontend/src/api.js (line 72). Data Flow: Sends email and password; returns the response from the backend.
+
+Function: api.post File Path: Team-Task-Board---Mini-Trello-main/frontend/src/api.js Line Numbers: 72-72 Purpose: Sends an HTTP POST request to the specified path with the given body. Connection: Calls request('POST', path, body ?? {}) from Team-Task-Board---Mini-Trello-main/frontend/src/api.js (line 35). Data Flow: Sends method, path, and body; returns the response from the server.
+
+Function: request File Path: Team-Task-Board---Mini-Trello-main/frontend/src/api.js Line Numbers: 35-68 Purpose: Sends an HTTP request and handles responses, including retries for 401 errors. Connection: Calls fetch(BASE + path, { method, credentials: 'include', headers, body }) from Team-Task-Board---Mini-Trello-main/frontend/src/api.js (line 38). Data Flow: Sends method, path, headers, and body; returns the response from the server.
+
+Function: login File Path: Team-Task-Board---Mini-Trello-main/app/controllers/auth_controller.py Line Numbers: 65-72 Purpose: Handles the login route, calls the authentication service, and sets authentication cookies. Connection: Calls service.login(body, request.headers.get("user-agent")) from Team-Task-Board---Mini-Trello-main/app/services/auth_service.py (line 89). Data Flow: Receives request body and user-agent; returns user, access token, and refresh token.
+
+Function: _client_ip File Path: Team-Task-Board---Mini-Trello-main/app/controllers/auth_controller.py Line Numbers: 19-20 Purpose: Retrieves the client IP address from the request. Connection: Called by login to generate a unique key for rate limiting. Data Flow: Receives request; returns client IP address.
+
+Function: AuthService.login File Path: Team-Task-Board---Mini-Trello-main/app/services/auth_service.py Line Numbers: 84-94 Purpose: Authenticates the user, verifies password, and starts a session. Connection: Calls self.users.find_by_email(request.email) from Team-Task-Board---Mini-Trello-main/app/repositories/user_repository.py (line 16). Data Flow: Receives request and user-agent; returns user, access token, and refresh token.
+
+Function: UserRepository.find_by_email File Path: Team-Task-Board---Mini-Trello-main/app/repositories/user_repository.py Line Numbers: 16-17 Purpose: Finds a user by email. Connection: Called by AuthService.login to retrieve user details. Data Flow: Receives email; returns user object.
+
+Function: verify_password File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 21-25 Purpose: Verifies the provided password against the stored hash. Connection: Called by AuthService.login to check user credentials. Data Flow: Receives password and password hash; returns boolean indicating success.
+
+Function: AuthService._start_session File Path: Team-Task-Board---Mini-Trello-main/app/services/auth_service.py Line Numbers: 123-131 Purpose: Starts a new session for the user. Connection: Calls self.sessions.create(user, user_agent) from Team-Task-Board---Mini-Trello-main/app/repositories/user_repository.py (line 44). Data Flow: Receives user and user-agent; returns refresh token.
+
+Function: create_access_token File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 37-45 Purpose: Creates an access token for the user. Connection: Called by AuthService.login to generate the access token. Data Flow: Receives user ID; returns access token.
+
+Function: generate_token File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 28-29 Purpose: Generates a random token. Connection: Called by AuthService._start_session to generate a refresh token. Data Flow: Receives no arguments; returns a token.

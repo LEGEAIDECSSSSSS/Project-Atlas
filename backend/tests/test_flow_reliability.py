@@ -128,7 +128,11 @@ def oracle(messages):
 def assert_packet_honest(packet):
     """Every VERIFIED DEFINITION is fully present as numbered source, or is named NOT VERIFIED."""
     defs = re.findall(r"^\d+\. \w+ `([^`]+)` \| (\S+) \| (\d+)-(\d+)$", packet, re.M)
-    not_verified = set(re.findall(r"^- `([^`]+)` \| (\S+) \| (\d+)-(\d+)", packet, re.M))
+    gap_text = ""
+    if "NOT VERIFIED" in packet:
+        gap_text = packet[packet.index("NOT VERIFIED"):].split("\n", 1)[0]
+    not_verified = {(n, p, a, b) for n, p, a, b in
+                    re.findall(r"`([^`]+)` \((\S+?):(\d+)-(\d+)(?:, did not fit)?\)", gap_text)}
     covered = {}
     for block in re.finditer(r"^SOURCE (\S+) \| lines (\d+)-(\d+) \| COMPLETE\n((?:\s*\d+ \| .*\n?)+)",
                              packet, re.M):
@@ -242,7 +246,7 @@ def test_packet_names_definitions_that_do_not_fit_instead_of_dropping_everything
         "edges": [], "frontend_chains": [], "frontend_ui_callers": []}
     text, report = pk.build_packet(records, route, 1900)
     assert "   1 | def two():" in text                              # the small essential one still fits
-    assert "- `one` | m.py | 1-62 (its source did not fit in the context budget)" in text
+    assert "`one` (m.py:1-62, did not fit)" in text
     assert [m["symbol"] for m in report["missing"]] == ["one"]
     assert_packet_honest(text)
 
@@ -251,7 +255,7 @@ def test_packet_ignores_incomplete_records_and_reports_the_gap():
     records, route = _fixture_world()
     records[1]["complete"] = False
     text, report = pk.build_packet(records, route, 20000)
-    assert "- `Svc.login` | svc/b.py | 2-3 (its complete source was not retrieved)" in text
+    assert "`Svc.login` (svc/b.py:2-3)" in text and "NOT VERIFIED" in text
     assert "SOURCE svc/b.py" not in text
     assert_packet_honest(text)
 
@@ -261,7 +265,8 @@ def test_packet_does_not_verify_a_definition_whose_declaration_is_absent():
     route["chain"][1]["symbol"] = "Svc.logout"                         # range is covered, name is not there
     text, report = pk.build_packet(records, route, 20000)
     assert [u["symbol"] for u in report["unverified"]] == ["Svc.logout"]
-    assert "declaration not found at the stated lines" in text
+    assert report["unverified"][0]["reason"] == "declaration not found at the stated lines"
+    assert "`Svc.logout` (svc/b.py:2-3)" in text and "NOT VERIFIED" in text
 
 
 def test_contained_records_are_not_duplicated():
@@ -494,7 +499,10 @@ def test_unknown_concepts_fall_back_to_search_and_still_reach_the_model(monkeypa
 
 @pytest.mark.parametrize("prompt_tokens", [2731, 3300, 4096, 6144, 12288, 24000])
 def test_context_stress_never_loses_source_silently(monkeypatch, taskboard, prompt_tokens):
+    # Set the window coherently, as LC_NUM_CTX would: the context is the prompt budget plus the
+    # tokens reserved for the answer.
     monkeypatch.setattr(config, "PROMPT_BUDGET_TOKENS", prompt_tokens)
+    monkeypatch.setattr(config, "NUM_CTX", prompt_tokens + config.OUTPUT_RESERVE_TOKENS)
     events, calls = run_agent(monkeypatch, taskboard, FLOW_PROMPT, oracle)
     packet = calls[0][-1]["content"]
     if "ATLAS VERIFIED FLOW EVIDENCE" in packet and "SOURCE " in packet:

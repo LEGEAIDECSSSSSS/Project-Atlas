@@ -1,0 +1,27 @@
+Function: submit File Path: Team-Task-Board---Mini-Trello-main/frontend/src/pages/Login.jsx Line Numbers: 27-44 Purpose: Handles the login form submission, validates the email, and calls the login function. Connection: Calls login(normaliseEmail(email), password) which is a project function. Data Flow: Receives email and password from the form, calls login with these, and handles the response.
+
+Function: login File Path: Team-Task-Board---Mini-Trello-main/frontend/src/auth.jsx Line Numbers: 38-44 Purpose: Sends a POST request to the /auth/login endpoint with the provided email and password. Connection: Calls api.post('/auth/login', { email, password }) which is a project function. Data Flow: Sends email and password to the backend, receives the response, and handles it.
+
+Function: api.post File Path: Team-Task-Board---Mini-Trello-main/frontend/src/api.js Line Numbers: 72-72 Purpose: A shorthand for sending a POST request. Connection: Calls request('POST', path, body ?? {}) which is a project function. Data Flow: Sends method, path, and body to request, and returns the response.
+
+Function: request File Path: Team-Task-Board---Mini-Trello-main/frontend/src/api.js Line Numbers: 35-68 Purpose: Sends an HTTP request and handles the response. Connection: Calls fetch(BASE + path, { method, credentials: 'include', headers, body }) which is an external library/platform API. Data Flow: Sends method, path, body, and credentials to fetch, and handles the response.
+
+Function: login File Path: Team-Task-Board---Mini-Trello-main/app/controllers/auth_controller.py Line Numbers: 65-72 Purpose: Handles the login route, validates the request, and calls the AuthService.login method. Connection: Calls service.login(body, request.headers.get("user-agent")) which is a project function. Data Flow: Receives request and service, calls service.login with these, and handles the response.
+
+Function: _client_ip File Path: Team-Task-Board---Mini-Trello-main/app/controllers/auth_controller.py Line Numbers: 19-20 Purpose: Retrieves the client IP address from the request. Connection: Cannot be established.
+
+Function: AuthService.login File Path: Team-Task-Board---Mini-Trello-main/app/services/auth_service.py Line Numbers: 84-94 Purpose: Authenticates the user, verifies the password, and starts a session. Connection: Calls self.users.find_by_email(request.email) and verify_password(request.password, user.password_hash if user else None) which are project functions. Data Flow: Receives request and user_agent, calls find_by_email and verify_password, and returns the user, access token, and refresh token.
+
+Function: UserRepository.find_by_email File Path: Team-Task-Board---Mini-Trello-main/app/repositories/user_repository.py Line Numbers: 16-17 Purpose: Finds a user by email. Connection: Cannot be established.
+
+Function: verify_password File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 21-25 Purpose: Verifies the provided password against the stored hash. Connection: Cannot be established.
+
+Function: _start_session File Path: Team-Task-Board---Mini-Trello-main/app/services/auth_service.py Line Numbers: 123-131 Purpose: Starts a new session for the user. Connection: Calls generate_token, SessionRepository.create, and hash_token which are project functions. Data Flow: Receives user and user_agent, calls generate_token, SessionRepository.create, and hash_token, and returns the refresh token.
+
+Function: create_access_token File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 37-45 Purpose: Creates an access token for the user. Connection: Calls generate_token which is a project function. Data Flow: Receives user_id, calls generate_token, and returns the access token.
+
+Function: generate_token File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 28-29 Purpose: Generates a token. Connection: Cannot be established.
+
+Function: SessionRepository.create File Path: Team-Task-Board---Mini-Trello-main/app/repositories/user_repository.py Line Numbers: 44-47 Purpose: Creates a new session record. Connection: Cannot be established.
+
+Function: hash_token File Path: Team-Task-Board---Mini-Trello-main/app/core/security.py Line Numbers: 32-34 Purpose: Hashes a token. Connection: Cannot be established.
